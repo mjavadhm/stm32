@@ -1,0 +1,15 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic-settings>=2.4
+openai>=1.40            # OpenAI-compatible client (works with Ollama /v1 too)
+sqlmodel>=0.0.21
+psycopg[binary]>=3.2
+celery[redis]>=5.4
+redis>=5.0
+qdrant-client>=1.10     # M2: vector knowledge base
+langgraph>=0.2          # M1: workflow graph
+httpx>=0.27
+
+# dev / CI
+pytest>=8.0
+ruff>=0.6
