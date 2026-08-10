@@ -1,53 +1,100 @@
-"""M1 workflow graph with conditional entry points.
+"""Workflow graph (M3).
 
-- full_project requests enter the End-to-End path (analyzer -> planner)
-- debug/optimize/test requests enter the Copilot path (copilot node)
+The router is the first node, not a step hidden inside the API handler. Every
+run therefore starts the same way, and the routing decision is visible in the
+progress view like any other agent.
 
-Mock nodes are replaced by real agents from M3 onward — the surrounding
-machinery (DB state tracking, Celery execution, progress API) stays the same.
+    router ─┬─ full_project ─> requirements -> datasheet -> architecture -> END
+            └─ debug/optimize/test ─> mock_copilot -> END
+
+`_PIPELINES` is the single source of truth for both the graph edges and the
+progress rows the worker creates. The previous version encoded the same
+routing decision twice -- once for the edges and once for the task list -- and
+those two copies were one edit away from disagreeing.
 """
 
 from langgraph.graph import END, StateGraph
 
-from app.agents.mock import mock_analyzer, mock_copilot, mock_planner
+from app.agents.architecture import architecture_node
+from app.agents.datasheet import datasheet_node
+from app.agents.mock import mock_copilot
+from app.agents.requirements import requirements_node
+from app.agents.router import router_node
 from app.db.models import RequestType
 from app.orchestrator.state import PipelineState
 
-FULL_PROJECT_SEQUENCE: list[str] = ["mock_analyzer", "mock_planner"]
-COPILOT_SEQUENCE: list[str] = ["mock_copilot"]
+ROUTER_NODE = "router"
+
+# request_type -> the agents that run after the router, in order.
+_PIPELINES: dict[str, list[str]] = {
+    RequestType.full_project.value: ["requirements", "datasheet", "architecture"],
+    RequestType.debug.value: ["mock_copilot"],
+    RequestType.optimize.value: ["mock_copilot"],
+    RequestType.test.value: ["mock_copilot"],
+}
+
+_NODES = {
+    ROUTER_NODE: router_node,
+    "requirements": requirements_node,
+    "datasheet": datasheet_node,
+    "architecture": architecture_node,
+    "mock_copilot": mock_copilot,  # replaced by real agents in M5
+}
 
 
-def agent_sequence_for(request_type: RequestType | str) -> list[str]:
-    """Agents that will run for a request type. The projects API pre-creates
-    one TaskRun per entry so progress is visible before execution starts."""
-    value = (
+def _value(request_type: RequestType | str) -> str:
+    return (
         request_type.value
         if isinstance(request_type, RequestType)
         else str(request_type)
     )
-    if value == RequestType.full_project.value:
-        return FULL_PROJECT_SEQUENCE
-    return COPILOT_SEQUENCE
 
 
-def _route_entry(state: PipelineState) -> str:
-    request_type = state.get("request_type", RequestType.full_project.value)
-    if request_type == RequestType.full_project.value:
-        return "mock_analyzer"
-    return "mock_copilot"
+def pipeline_for(request_type: RequestType | str) -> list[str]:
+    """Agents that run after the router for a request type."""
+    return list(
+        _PIPELINES.get(_value(request_type), _PIPELINES[RequestType.debug.value])
+    )
+
+
+def agent_sequence_for(request_type: RequestType | str | None = None) -> list[str]:
+    """Full expected sequence, including the router.
+
+    Called with no argument before routing has happened: at enqueue time the
+    request type is genuinely unknown, so only the router row can be created
+    and the worker fills in the rest once the router has decided.
+    """
+    if request_type is None:
+        return [ROUTER_NODE]
+    return [ROUTER_NODE, *pipeline_for(request_type)]
+
+
+def _route_after_router(state: PipelineState) -> str:
+    return pipeline_for(state.get("request_type", RequestType.full_project.value))[0]
 
 
 def build_graph():
     graph = StateGraph(PipelineState)
-    graph.add_node("mock_analyzer", mock_analyzer)
-    graph.add_node("mock_planner", mock_planner)
-    graph.add_node("mock_copilot", mock_copilot)
+    for name, node in _NODES.items():
+        graph.add_node(name, node)
 
-    graph.set_conditional_entry_point(
-        _route_entry,
-        {"mock_analyzer": "mock_analyzer", "mock_copilot": "mock_copilot"},
+    graph.set_entry_point(ROUTER_NODE)
+
+    # One branch per distinct pipeline head.
+    heads = {pipeline[0] for pipeline in _PIPELINES.values()}
+    graph.add_conditional_edges(
+        ROUTER_NODE, _route_after_router, {head: head for head in heads}
     )
-    graph.add_edge("mock_analyzer", "mock_planner")
-    graph.add_edge("mock_planner", END)
-    graph.add_edge("mock_copilot", END)
+
+    # Chain each pipeline, then terminate it.
+    linked: set[tuple[str, str]] = set()
+    for pipeline in _PIPELINES.values():
+        for current, following in zip(pipeline, pipeline[1:], strict=False):
+            if (current, following) not in linked:
+                graph.add_edge(current, following)
+                linked.add((current, following))
+        if (pipeline[-1], END) not in linked:
+            graph.add_edge(pipeline[-1], END)
+            linked.add((pipeline[-1], END))
+
     return graph.compile()

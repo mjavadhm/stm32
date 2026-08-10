@@ -1,0 +1,39 @@
+# Attaches the PageVault stack to the shared `rag-net` network so the STM32
+# assistant can reach it, WITHOUT modifying the PageVault repo.
+#
+# PageVault stays a standalone open-source project: on its own it still comes
+# up with a plain `docker compose up` and knows nothing about STM32.
+#
+# Run it with this file added last:
+#
+#   docker network create rag-net           # once, ever
+#   docker compose \
+#     -f ../pagevault/docker-compose.yml \
+#     -f ../pagevault/docker-compose.textrag.yml \
+#     -f deploy/pagevault-rag.override.yml \
+#     up -d
+#
+# Or simply: make kb-up
+#
+# Relative build contexts resolve against the FIRST -f file, so pointing at
+# this file from another directory is safe.
+
+services:
+  api:
+    networks:
+      # Mapping form (not a list): the alias below requires it.
+      default: {}
+      rag-net:
+        aliases:
+          # The hostname the STM32 backend uses (PAGEVAULT_URL). In its own
+          # stack this service is called `api`, which is far too generic a
+          # name to expose on a shared network.
+          - pagevault-api
+    ports:
+      # Remapped: the STM32 backend already owns host port 8000. Inside the
+      # network the port is still 8000, so PAGEVAULT_URL never changes.
+      - "8100:8000"
+
+networks:
+  rag-net:
+    external: true

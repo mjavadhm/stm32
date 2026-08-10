@@ -1,15 +1,15 @@
 import uuid
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 
 from sqlmodel import Field, SQLModel
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
-class RequestType(str, Enum):
+class RequestType(StrEnum):
     """Pipeline entry points (End-to-End vs Copilot modes)."""
 
     full_project = "full_project"  # End-to-End generation
@@ -18,7 +18,7 @@ class RequestType(str, Enum):
     test = "test"                  # Copilot: generate/run tests
 
 
-class RunStatus(str, Enum):
+class RunStatus(StrEnum):
     pending = "pending"
     running = "running"
     done = "done"

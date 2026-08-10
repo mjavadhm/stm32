@@ -40,6 +40,9 @@ services:
       - "8000:8000"
     volumes:
       - ./backend:/app
+    networks:
+      - default
+      - rag-net
     depends_on:
       postgres:
         condition: service_healthy
@@ -50,10 +53,16 @@ services:
 
   worker:
     build: ./backend
-    command: celery -A app.workers.celery_app worker --loglevel=info
+    # Agents query the knowledge base from inside the worker, so it needs the
+    # shared network too. `-Q celery` is explicit on purpose: this worker must
+    # only ever consume its own queue.
+    command: celery -A app.workers.celery_app worker --loglevel=info -Q celery
     env_file: .env
     volumes:
       - ./backend:/app
+    networks:
+      - default
+      - rag-net
     depends_on:
       redis:
         condition: service_healthy
@@ -83,3 +92,14 @@ volumes:
   pgdata:
   qdrant_data:
   ollama_data:
+
+networks:
+  # Shared with the PageVault stack (the knowledge base, M2). PageVault keeps
+  # its own database, Redis and Qdrant; the only thing crossing this network
+  # is HTTP. Create it once before the first `docker compose up`:
+  #
+  #   docker network create rag-net
+  #
+  # See docs/knowledge-base.md.
+  rag-net:
+    external: true

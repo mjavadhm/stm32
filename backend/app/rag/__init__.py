@@ -1,8 +1,29 @@
-"""RAG package (M2).
+"""Knowledge-base access (M2).
 
-Will contain: document ingestion, chunking, embeddings, Qdrant collections
-and the semantic search API with chip-family/document-type filters.
+Retrieval is provided by PageVault, a separate open-source service that runs
+in its own Docker stack and is reached over HTTP. This package holds only the
+client: no ingestion, no chunking, no Qdrant code lives here.
 
-IMPORTANT: fix the embedding model (EMBEDDING_MODEL in .env) before creating
-Qdrant collections — changing it later requires a full re-index.
+    from app.rag import get_rag_client
+
+    context = await get_rag_client().search("DMA registers on STM32F407")
+    prompt = context.as_prompt()
+
+Running the two stacks: see `docs/knowledge-base.md`.
 """
+
+from app.rag.client import (
+    PageVaultClient,
+    RagContext,
+    Snippet,
+    close_rag_client,
+    get_rag_client,
+)
+
+__all__ = [
+    "PageVaultClient",
+    "RagContext",
+    "Snippet",
+    "close_rag_client",
+    "get_rag_client",
+]

@@ -5,5 +5,19 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
+[tool.ruff.lint.flake8-bugbear]
+# `Depends(...)` in a default argument is how FastAPI dependency injection
+# works; B008 targets accidental mutable/evaluated defaults, not this. The
+# alternative (calling Depends inside the body) breaks DI entirely.
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Query",
+    "fastapi.Path",
+    "fastapi.Body",
+    "fastapi.Header",
+    "fastapi.File",
+    "fastapi.Form",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

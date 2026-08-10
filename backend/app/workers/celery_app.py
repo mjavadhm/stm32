@@ -1,5 +1,6 @@
+import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from celery import Celery
 
@@ -14,7 +15,7 @@ celery_app.conf.task_track_started = True
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 @celery_app.task(name="ping")
@@ -27,39 +28,25 @@ def ping() -> str:
 def run_pipeline(project_id: str) -> str:
     """Execute the workflow graph for a project, updating DB state live.
 
-    Cancellation is cooperative: the project status is re-checked after each
-    agent finishes, so a cancel request takes effect between nodes.
+    Celery tasks are synchronous, but the graph is driven asynchronously so
+    that agents can be `async def` from M3 onward (LangGraph only awaits
+    coroutine nodes on the astream/ainvoke path) and so that an agent can
+    issue several knowledge-base lookups concurrently.
     """
+    return asyncio.run(_run_pipeline(project_id))
+
+
+async def _run_pipeline(project_id: str) -> str:
     from sqlmodel import Session, select
 
     from app.db.models import Project, RunStatus, TaskRun
     from app.db.session import engine
-    from app.orchestrator.graph import build_graph
-
-    # --- mark project as running ---
-    with Session(engine) as session:
-        project = session.get(Project, project_id)
-        if project is None:
-            return "not-found"
-        if project.status == RunStatus.cancelled:
-            return "cancelled"
-        project.status = RunStatus.running
-        project.updated_at = _utcnow()
-        session.add(project)
-        session.commit()
-        user_request = project.user_request
-        request_type = project.request_type
-
-    graph = build_graph()
-    state = {
-        "project_id": project_id,
-        "user_request": user_request,
-        "request_type": (
-            request_type.value
-            if hasattr(request_type, "value")
-            else str(request_type)
-        ),
-    }
+    from app.orchestrator.graph import (
+        ROUTER_NODE,
+        agent_sequence_for,
+        build_graph,
+        pipeline_for,
+    )
 
     def _set_task(session: Session, agent_name: str, **updates) -> None:
         task = session.exec(
@@ -74,10 +61,88 @@ def run_pipeline(project_id: str) -> str:
             setattr(task, key, value)
         session.add(task)
 
+    def _close_unfinished(session: Session, status: RunStatus) -> None:
+        """Resolve tasks that will now never run.
+
+        Without this, a cancelled or failed pipeline leaves its remaining
+        agents sitting at `pending` forever and the dashboard implies work
+        is still queued.
+        """
+        tasks = session.exec(
+            select(TaskRun).where(TaskRun.project_id == project_id)
+        ).all()
+        for task in tasks:
+            if task.status in (RunStatus.pending, RunStatus.running):
+                task.status = status
+                task.finished_at = _utcnow()
+                session.add(task)
+
+    def _fail_project(exc: Exception, failed_agent: str | None) -> None:
+        with Session(engine) as session:
+            if failed_agent is not None:
+                _set_task(
+                    session,
+                    failed_agent,
+                    status=RunStatus.failed,
+                    error=str(exc),
+                    finished_at=_utcnow(),
+                )
+            _close_unfinished(session, RunStatus.cancelled)
+            project = session.get(Project, project_id)
+            if project is not None:
+                project.status = RunStatus.failed
+                project.error = str(exc)
+                project.updated_at = _utcnow()
+                session.add(project)
+            session.commit()
+
+    # --- mark project as running ---
+    with Session(engine) as session:
+        project = session.get(Project, project_id)
+        if project is None:
+            return "not-found"
+        if project.status == RunStatus.cancelled:
+            _close_unfinished(session, RunStatus.cancelled)
+            session.commit()
+            return "cancelled"
+        project.status = RunStatus.running
+        project.updated_at = _utcnow()
+        session.add(project)
+        session.commit()
+        user_request = project.user_request
+
+    # Only the router is known up front -- it is what decides the request
+    # type, and therefore which agents run after it. The sequence is extended
+    # below as soon as the router reports back.
+    sequence = agent_sequence_for()
+
+    state = {
+        "project_id": project_id,
+        "user_request": user_request,
+    }
+
+    # The agent currently believed to be executing. `stream_mode="updates"`
+    # only reports a node *after* it finishes, so the running marker is
+    # driven from the known sequence: mark the first agent running up front,
+    # then mark the next one as each completes. This is also what makes
+    # error attribution possible -- when the graph raises, this is the node
+    # that raised.
+    position = 0
+    current_agent: str | None = sequence[0] if sequence else None
+
+    if current_agent is not None:
+        with Session(engine) as session:
+            _set_task(
+                session,
+                current_agent,
+                status=RunStatus.running,
+                started_at=_utcnow(),
+            )
+            session.commit()
+
     try:
-        # stream(..., stream_mode="updates") yields {node_name: partial_state}
-        # after each node finishes — that is our live progress hook.
-        for event in graph.stream(state, stream_mode="updates"):
+        graph = build_graph()
+        async for event in graph.astream(state, stream_mode="updates"):
             for node_name, update in event.items():
                 with Session(engine) as session:
                     project = session.get(Project, project_id)
@@ -88,8 +153,10 @@ def run_pipeline(project_id: str) -> str:
                             status=RunStatus.cancelled,
                             finished_at=_utcnow(),
                         )
+                        _close_unfinished(session, RunStatus.cancelled)
                         session.commit()
                         return "cancelled"
+
                     _set_task(
                         session,
                         node_name,
@@ -97,6 +164,50 @@ def run_pipeline(project_id: str) -> str:
                         result=json.dumps(update, ensure_ascii=False, default=str),
                         finished_at=_utcnow(),
                     )
+
+                    # The router just told us which pipeline this is: persist
+                    # the decision and materialise the remaining progress rows
+                    # so the dashboard shows the real agent list from here on.
+                    if node_name == ROUTER_NODE and update.get("request_type"):
+                        request_type_value = update["request_type"]
+                        sequence = [ROUTER_NODE, *pipeline_for(request_type_value)]
+                        project = session.get(Project, project_id)
+                        if project is not None:
+                            project.request_type = request_type_value
+                            project.updated_at = _utcnow()
+                            session.add(project)
+                        existing = {
+                            task.agent_name
+                            for task in session.exec(
+                                select(TaskRun).where(
+                                    TaskRun.project_id == project_id
+                                )
+                            ).all()
+                        }
+                        for agent_name in sequence:
+                            if agent_name not in existing:
+                                session.add(
+                                    TaskRun(
+                                        project_id=project_id,
+                                        agent_name=agent_name,
+                                    )
+                                )
+
+                    # Advance the running marker to whatever comes next.
+                    if node_name in sequence:
+                        position = sequence.index(node_name) + 1
+                    else:
+                        position += 1
+                    current_agent = (
+                        sequence[position] if position < len(sequence) else None
+                    )
+                    if current_agent is not None:
+                        _set_task(
+                            session,
+                            current_agent,
+                            status=RunStatus.running,
+                            started_at=_utcnow(),
+                        )
                     session.commit()
 
         with Session(engine) as session:
@@ -105,16 +216,9 @@ def run_pipeline(project_id: str) -> str:
                 project.status = RunStatus.done
                 project.updated_at = _utcnow()
                 session.add(project)
-                session.commit()
+            session.commit()
         return "done"
 
     except Exception as exc:
-        with Session(engine) as session:
-            project = session.get(Project, project_id)
-            if project is not None:
-                project.status = RunStatus.failed
-                project.error = str(exc)
-                project.updated_at = _utcnow()
-                session.add(project)
-                session.commit()
+        _fail_project(exc, current_agent)
         return "failed"

@@ -4,9 +4,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import agents, health, projects
+from app.api.routes import agents, health, projects, rag
 from app.core.config import settings
 from app.db.session import init_db
+from app.rag import close_rag_client
 
 
 @asynccontextmanager
@@ -21,6 +22,8 @@ async def lifespan(app: FastAPI):
                 raise
             await asyncio.sleep(2)
     yield
+    # Release the knowledge-base connection pool on shutdown.
+    await close_rag_client()
 
 
 app = FastAPI(
@@ -40,3 +43,4 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(projects.router)
 app.include_router(agents.router)
+app.include_router(rag.router)

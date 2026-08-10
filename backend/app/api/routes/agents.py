@@ -4,6 +4,7 @@ from sqlmodel import Session, select
 
 from app.agents import KNOWN_AGENTS
 from app.core.config import settings
+from app.core.llm import invalidate_agent_settings_cache
 from app.db.models import AgentSetting, utcnow
 from app.db.session import get_session
 
@@ -56,6 +57,11 @@ def update_agent_setting(
     session.add(row)
     session.commit()
     session.refresh(row)
+
+    # Agent model/enabled lookups are cached; without this the dashboard
+    # would appear to save a change that agents ignore for up to a TTL.
+    invalidate_agent_settings_cache()
+
     return {
         "agent_name": row.agent_name,
         "model": row.model or settings.llm_model,

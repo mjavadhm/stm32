@@ -9,8 +9,15 @@ Fallback: deterministic keyword rules — used when the router agent is
 disabled, the provider is unreachable, or the reply is malformed.
 """
 
+import asyncio
+import logging
+from typing import Any
+
+from app.core.config import settings
 from app.core.llm import get_agent_llm, is_agent_enabled
 from app.db.models import RequestType
+
+logger = logging.getLogger(__name__)
 
 _RULES: list[tuple[RequestType, tuple[str, ...]]] = [
     (
@@ -66,12 +73,43 @@ async def _classify_with_llm(text: str) -> RequestType:
     raise ValueError(f"Unexpected router reply: {reply!r}")
 
 
-async def classify_request(text: str) -> RequestType:
-    """LLM classification with keyword-rule fallback."""
+async def classify_request(text: str) -> tuple[RequestType, str]:
+    """LLM classification with keyword-rule fallback. Returns (type, method).
+
+    Bounded by `router_timeout_seconds`: a slightly worse label is much better
+    than a pipeline stuck on an unresponsive provider. The ceiling is separate
+    from the client's own timeout because it also has to cover the SDK's
+    internal retries.
+
+    The method ("llm" or "rules") is returned rather than logged away: when a
+    request is routed to the wrong pipeline, the first thing worth knowing is
+    whether the model chose it or the keyword fallback did.
+    """
     if not is_agent_enabled("router"):
-        return classify_by_rules(text)
+        return classify_by_rules(text), "rules:disabled"
     try:
-        return await _classify_with_llm(text)
-    except Exception:
-        # Provider unreachable / malformed reply -> deterministic fallback.
-        return classify_by_rules(text)
+        request_type = await asyncio.wait_for(
+            _classify_with_llm(text),
+            timeout=settings.router_timeout_seconds,
+        )
+        return request_type, "llm"
+    except TimeoutError:
+        return classify_by_rules(text), "rules:timeout"
+    except Exception as exc:
+        # Provider unreachable or malformed reply -> deterministic fallback.
+        logger.warning("router LLM classification failed: %s", exc)
+        return classify_by_rules(text), "rules:error"
+
+
+async def router_node(state: dict[str, Any]) -> dict[str, Any]:
+    """LangGraph node: the pipeline's first step (M3).
+
+    Routing moved out of the `POST /projects` handler so the API can return as
+    soon as the project row exists, and so the routing decision shows up in
+    the progress view like any other agent instead of happening invisibly.
+    """
+    request_type, method = await classify_request(state.get("user_request", ""))
+    return {
+        "request_type": request_type.value,
+        "routing": {"request_type": request_type.value, "method": method},
+    }

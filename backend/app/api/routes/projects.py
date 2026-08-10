@@ -2,7 +2,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
-from app.agents.router import classify_request
 from app.db.models import Project, RunStatus, TaskRun, utcnow
 from app.db.session import get_session
 from app.orchestrator.graph import agent_sequence_for
@@ -29,25 +28,26 @@ def _project_summary(project: Project) -> dict:
 
 
 @router.post("", status_code=201)
-async def create_project(
+def create_project(
     payload: ProjectCreate,
     session: Session = Depends(get_session),
 ) -> dict:
-    """Create a project, route the request (LLM router), and enqueue the pipeline."""
-    request_type = await classify_request(payload.request)
+    """Create a project and enqueue the pipeline.
 
-    project = Project(
-        name=payload.name,
-        user_request=payload.request,
-        request_type=request_type,
-    )
+    Routing used to happen here, which meant a slow or unreachable LLM held
+    the user's HTTP request open. Since M3 the router is the graph's first
+    node, so this handler only persists the request and returns; the request
+    type is filled in by the worker moments later.
+
+    Only the router task is pre-created, because the remaining agents are not
+    known until the router has run.
+    """
+    project = Project(name=payload.name, user_request=payload.request)
     session.add(project)
     session.commit()
     session.refresh(project)
 
-    # Pre-create pending TaskRuns (per entry path) so progress is visible
-    # immediately.
-    for agent_name in agent_sequence_for(project.request_type):
+    for agent_name in agent_sequence_for():
         session.add(TaskRun(project_id=project.id, agent_name=agent_name))
     session.commit()
 

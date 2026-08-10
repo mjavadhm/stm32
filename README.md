@@ -2,7 +2,7 @@
 
 پلتفرم چند-ایجنتی (Multi-Agent) برای تولید، دیباگ، بهینه‌سازی و تست فرم‌ور STM32.
 
-این ریپو خروجی **مایلستون M0** است: زیرساخت، اسکلت سرویس‌ها و CI.
+وضعیت فعلی: **M0 تا M3** — زیرساخت، ارکستریتور، اتصال پایگاه دانش، و ایجنت‌های تحلیل و طراحی.
 
 ## پشته فناوری
 
@@ -59,7 +59,34 @@ LLM_MODEL=qwen2.5-coder:14b
 docker compose --profile local up -d ollama
 ```
 
-> ⚠️ **نکته مهم:** مدل Embedding (`EMBEDDING_MODEL`) را قبل از شروع M2 قطعی کنید؛ تغییر آن بعد از ساخت کالکشن‌های Qdrant یعنی re-index کامل پایگاه دانش.
+> ⚠️ **نکته مهم:** مدل Embedding را قبل از ingest انبوه قطعی کنید؛ تغییر آن بعد از ساخت کالکشن‌ها یعنی re-index کامل پایگاه دانش.
+
+## پایگاه دانش (M2)
+
+بازیابی در این ریپو پیاده‌سازی نشده؛ توسط **PageVault** انجام می‌شود — یک سرویس اپن‌سورس مستقل که در استک داکر خودش بالا می‌آید و از طریق HTTP روی شبکهٔ مشترک `rag-net` صدا زده می‌شود.
+
+```bash
+docker network create rag-net     # یک‌بار برای همیشه
+make up-all                       # اول پایگاه دانش، بعد این پروژه
+# یا: make up-all PAGEVAULT_DIR=/path/to/pagevault
+
+make kb-check                     # آیا از داخل بک‌اند در دسترس است؟
+curl localhost:8000/rag/health
+```
+
+تست بدون اجرای پایپ‌لاین:
+
+```bash
+# فقط بازیابی، بدون LLM — برای تشخیص اینکه مشکل از recall است یا از تولید
+curl -X POST localhost:8000/rag/search -H 'content-type: application/json' \
+  -d '{"query": "DMA registers on STM32F407"}'
+
+# Datasheet Agent: بازیابی + پاسخ همراه با ارجاع
+curl -X POST localhost:8000/rag/ask -H 'content-type: application/json' \
+  -d '{"question": "How do I use HAL_SPI_Transmit with DMA on STM32F407?"}'
+```
+
+چرایی دو استک جدا به‌جای یکی، و قرارداد نوشتن ایجنت‌های مبتنی بر ارجاع: [`docs/knowledge-base.md`](docs/knowledge-base.md)
 
 ## ساختار پروژه
 
@@ -68,14 +95,16 @@ docker compose --profile local up -d ollama
 │   ├── app/
 │   │   ├── main.py          # اپ FastAPI
 │   │   ├── core/            # config + کارخانه کلاینت LLM
-│   │   ├── api/routes/      # اندپوینت‌ها (فعلاً health)
-│   │   ├── agents/          # ایجنت‌ها (M1+ — فعلاً خالی)
+│   │   ├── api/routes/      # health / projects / agents / rag
+│   │   ├── agents/          # router, requirements, datasheet, architecture
+│   │   ├── orchestrator/    # گراف LangGraph + قراردادهای بین ایجنت‌ها
 │   │   ├── workers/         # Celery
 │   │   ├── db/              # SQLModel / انجین دیتابیس
-│   │   └── rag/             # زیرساخت RAG (M2 — فعلاً خالی)
+│   │   └── rag/             # کلاینت HTTP پایگاه دانش (PageVault)
 │   └── tests/
 ├── frontend/                # Next.js (داشبورد — M7 تکمیل می‌شود)
-├── docs/                    # مستندات معماری
+├── deploy/                  # override اتصال PageVault به شبکهٔ rag-net
+├── docs/                    # معماری + پایگاه دانش + پلن M3
 ├── docker-compose.yml       # postgres + redis + qdrant + backend + worker + frontend (+ ollama)
 └── .github/workflows/ci.yml # Lint + Test
 ```
@@ -83,9 +112,9 @@ docker compose --profile local up -d ollama
 ## مایلستون‌ها
 
 - [x] **M0** — زیرساخت و اسکلت پروژه (این ریپو)
-- [ ] **M1** — ارکستریتور و مدیریت تسک‌ها (LangGraph + Celery + روتر)
-- [ ] **M2** — پایگاه دانش و RAG (Qdrant + Ingestion)
-- [ ] **M3** — ایجنت‌های تحلیل و طراحی
+- [x] **M1** — ارکستریتور و مدیریت تسک‌ها (LangGraph + Celery + روتر)
+- [ ] **M2** — پایگاه دانش و RAG — از طریق [PageVault](https://github.com/mjavadhm/pagevault) (اتصال برقرار است؛ باقی‌مانده: ingest مستندات و ارزیابی recall)
+- [x] **M3** — ایجنت‌های تحلیل و طراحی ([پلن](docs/m3-plan.md))
 - [ ] **M4** — ایجنت‌های تولید کد + کامپایل ایزوله
 - [ ] **M5** — ایجنت‌های کیفیت (Review / Debug / Optimize / Test)
 - [ ] **M6** — مستندسازی و تحویل
