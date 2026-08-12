@@ -40,9 +40,17 @@ services:
       - "8000:8000"
     volumes:
       - ./backend:/app
+      # Generated projects live here. The builder mounts the same volume, so
+      # source never travels over HTTP -- only the project id does.
+      - workspaces:/workspaces
+      # ST's HAL/CMSIS sources, downloaded into the builder image and shared
+      # read-only. The scaffold copies the drivers each project needs out of
+      # here, so git carries none of them.
+      - cube_sdk:/opt/stm32cube:ro
     networks:
       - default
       - rag-net
+      - build-net
     depends_on:
       postgres:
         condition: service_healthy
@@ -50,6 +58,10 @@ services:
         condition: service_healthy
       qdrant:
         condition: service_started
+      # Waiting for healthy also means the driver volume has been populated
+      # from the builder image before anything tries to read it.
+      builder:
+        condition: service_healthy
 
   worker:
     build: ./backend
@@ -60,14 +72,42 @@ services:
     env_file: .env
     volumes:
       - ./backend:/app
+      - workspaces:/workspaces
+      - cube_sdk:/opt/stm32cube:ro
     networks:
       - default
       - rag-net
+      - build-net
     depends_on:
       redis:
         condition: service_healthy
       postgres:
         condition: service_healthy
+
+  # Compile sandbox (M4). Reachable only from the backend and the worker,
+  # and able to reach nothing at all: a generated Makefile cannot download a
+  # dependency, phone home, or touch the database. Resource limits are there
+  # because a generated project can also just be an infinite loop.
+  builder:
+    build: ./deploy/builder
+    environment:
+      WORKSPACE_ROOT: /workspaces
+      BUILD_TIMEOUT_SECONDS: ${BUILD_TIMEOUT_SECONDS:-120}
+    volumes:
+      - workspaces:/workspaces
+      # Docker fills this volume from the image the first time the container
+      # starts, which is how the drivers reach the backend without git and
+      # without a network call at runtime.
+      - cube_sdk:/opt/stm32cube
+    networks:
+      - build-net
+    read_only: true
+    tmpfs:
+      - /tmp
+    mem_limit: 2g
+    cpus: 2.0
+    security_opt:
+      - no-new-privileges:true
 
   frontend:
     build: ./frontend
@@ -92,6 +132,12 @@ volumes:
   pgdata:
   qdrant_data:
   ollama_data:
+  # Generated projects, one directory per project id. Shared by the backend,
+  # the worker and the builder.
+  workspaces:
+  # ST's HAL/CMSIS sources, populated from the builder image. Delete it with
+  # `make sdk-refresh` after rebuilding the image with different refs.
+  cube_sdk:
 
 networks:
   # Shared with the PageVault stack (the knowledge base, M2). PageVault keeps
@@ -103,3 +149,8 @@ networks:
   # See docs/knowledge-base.md.
   rag-net:
     external: true
+
+  # Internal on purpose: this network has no gateway, so the build sandbox
+  # can be called by the backend and the worker and can reach nothing else.
+  build-net:
+    internal: true

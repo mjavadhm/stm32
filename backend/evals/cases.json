@@ -1,0 +1,27 @@
+[
+  {
+    "id": "spi-dma-imu",
+    "request": "STM32F407VG on a Discovery board. Read an MPU6050 IMU over SPI1 at 1 kHz using DMA, and stream the samples to a PC over USART2 at 921600 baud. Bare metal, no RTOS.",
+    "expect_peripherals": ["SPI1", "USART2", "DMA"]
+  },
+  {
+    "id": "i2c-sensor-log",
+    "request": "STM32F103C8T6 blue pill. Read a BME280 over I2C1 every second, write the readings to an SD card over SPI2, and blink an LED on PC13 as a heartbeat.",
+    "expect_peripherals": ["I2C1", "SPI2"]
+  },
+  {
+    "id": "freertos-uart-console",
+    "request": "STM32L476RG Nucleo with FreeRTOS. One task reads an ADC channel at 10 kHz into a DMA circular buffer, another task serves a command console over USART2 with interrupts.",
+    "expect_peripherals": ["ADC", "USART2"]
+  },
+  {
+    "id": "pwm-motor-encoder",
+    "request": "STM32G431 driving a BLDC motor: three complementary PWM outputs on TIM1 with dead time, quadrature encoder on TIM2, current sensing on ADC1 triggered by TIM1.",
+    "expect_peripherals": ["TIM1", "TIM2", "ADC1"]
+  },
+  {
+    "id": "vague-no-mcu",
+    "request": "I want to read a temperature sensor and show it somewhere. Which chip should I use?",
+    "expect_peripherals": []
+  }
+]

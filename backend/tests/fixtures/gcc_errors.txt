@@ -1,0 +1,23 @@
+arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard -Wall -Wextra -Og -g3 -c Core/Src/main.c -o build/main.o
+/workspaces/7f3a1c/Core/Src/main.c: In function 'main':
+/workspaces/7f3a1c/Core/Src/main.c:42:5: error: 'hspi1' undeclared (first use in this function); did you mean 'hspi'?
+   42 |     hspi1.Instance = SPI1;
+      |     ^~~~~
+      |     hspi
+/workspaces/7f3a1c/Core/Src/main.c:42:5: note: each undeclared identifier is reported only once for each function it appears in
+/workspaces/7f3a1c/Core/Src/main.c:57:9: error: implicit declaration of function 'MPU6050_ReadAccel' [-Werror=implicit-function-declaration]
+   57 |         MPU6050_ReadAccel(&imu, &sample);
+      |         ^~~~~~~~~~~~~~~~~
+/workspaces/7f3a1c/Core/Src/mpu6050.c:88:13: warning: unused variable 'status' [-Wunused-variable]
+   88 |     uint8_t status = 0;
+      |             ^~~~~~
+/workspaces/7f3a1c/Core/Src/mpu6050.c:120:1: warning: control reaches end of non-void function [-Wreturn-type]
+  120 | }
+      | ^
+make: *** [Makefile:74: build/main.o] Error 1
+arm-none-eabi-gcc build/main.o build/mpu6050.o -o build/app.elf
+/usr/lib/gcc/arm-none-eabi/12.2.1/../../../arm-none-eabi/bin/ld: build/mpu6050.o: in function `MPU6050_Init':
+/workspaces/7f3a1c/Core/Src/mpu6050.c:31: undefined reference to `HAL_I2C_Mem_Write'
+/usr/lib/gcc/arm-none-eabi/12.2.1/../../../arm-none-eabi/bin/ld: region `RAM' overflowed by 4096 bytes
+collect2: error: ld returned 1 exit status
+make[1]: *** [Makefile:81: build/app.elf] Error 1

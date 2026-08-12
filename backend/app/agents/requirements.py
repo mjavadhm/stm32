@@ -17,6 +17,7 @@ Two behaviours matter more than the prompt:
 import logging
 from typing import Any
 
+from app.agents.base import request_contract
 from app.agents.datasheet import detect_family
 from app.core.llm import get_agent_llm
 from app.orchestrator.contracts import (
@@ -24,7 +25,6 @@ from app.orchestrator.contracts import (
     PeripheralNeed,
     Requirements,
     dump,
-    parse_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -114,21 +114,22 @@ async def analyze_requirements(user_request: str) -> tuple[Requirements, list[st
     """Return structured requirements plus any warnings raised on the way."""
     warnings: list[str] = []
     llm = get_agent_llm(AGENT_NAME)
-    reply = await llm.chat(
-        [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": user_request},
-        ],
-        temperature=0,
-    )
+    messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": user_request},
+    ]
 
     try:
-        requirements = parse_model(Requirements, reply)
+        requirements, repair_warnings, _reply = await request_contract(
+            llm, Requirements, messages
+        )
     except ContractError as exc:
         logger.warning("requirements parsing failed: %s", exc)
         requirements, reason = _fallback(user_request, str(exc))
         warnings.append(f"requirements degraded: {reason}")
         return requirements, warnings
+
+    warnings.extend(repair_warnings)
 
     requirements = _normalise(requirements, user_request)
     if not requirements.mcu:

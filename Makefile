@@ -44,10 +44,43 @@ logs:
 ollama-up:
 	docker compose --profile local up -d ollama
 
+# Does retrieval still work *with* the family filter applied? kb-check only
+# proves PageVault is up; this proves a real query comes back with something.
+kb-probe:
+	docker compose exec backend python -m scripts.kb_probe
+
+# Quality numbers for the design pipeline. Needs a live LLM and PageVault.
+eval:
+	docker compose exec backend python -m evals.run_eval
+
+# Build the compile sandbox (arm-none-eabi toolchain, ~1 GB image). This is
+# also the step that downloads ST's HAL/CMSIS sources, so it needs internet.
+# Nothing after it does.
+builder-image:
+	docker compose build builder
+
+# Which drivers did the image download, and can the backend read them?
+sdk-check:
+	docker compose exec backend python -m scripts.sdk_check
+
+# Refresh the drivers after rebuilding the image with different refs. Docker
+# only copies them into the volume while it is empty, so an old volume would
+# quietly hide a new SDK.
+sdk-refresh:
+	docker compose rm -sf builder
+	-docker volume rm $$(docker compose config --format json | \
+		python3 -c "import json,sys; print(json.load(sys.stdin)['name'])")_cube_sdk
+	docker compose up -d builder
+
+# Compile a project we know is good. If this fails, the toolchain or the
+# wiring is broken -- not the generated code. Runs in CI.
+golden:
+	docker compose exec backend python -m scripts.build_golden
+
 test:
 	cd backend && pytest -q
 
 lint:
 	cd backend && ruff check .
 
-.PHONY: up down logs ollama-up test lint net kb-up kb-down kb-logs up-all down-all kb-check
+.PHONY: up down logs ollama-up test lint net kb-up kb-down kb-logs up-all down-all kb-check kb-probe eval builder-image golden sdk-check sdk-refresh

@@ -111,6 +111,17 @@ class RagContext:
         return rendered
 
 
+def _above_score(snippets: list[Snippet], min_score: float) -> list[Snippet]:
+    """Drop low-confidence hits.
+
+    A snippet with score 0.0 is kept: PageVault omits the score on exact
+    lookups, and "no score reported" must not be read as "scored zero".
+    """
+    if min_score <= 0:
+        return snippets
+    return [s for s in snippets if s.score == 0.0 or s.score >= min_score]
+
+
 def _snippet_from_chunk(raw: dict[str, Any], channel: str = "chunk") -> Snippet:
     return Snippet(
         channel=channel,
@@ -240,13 +251,19 @@ class PageVaultClient:
 
         return RagContext(
             query=query,
-            chunks=[_snippet_from_chunk(item) for item in data.get("chunks", [])],
+            chunks=_above_score(
+                [_snippet_from_chunk(item) for item in data.get("chunks", [])],
+                settings.rag_min_score,
+            ),
             symbols=[_snippet_from_symbol(item) for item in data.get("symbols", [])],
             type_context=[
                 _snippet_from_symbol(item, channel="type")
                 for item in data.get("type_context", [])
             ],
-            pages=[_snippet_from_page(item) for item in data.get("pages", [])],
+            pages=_above_score(
+                [_snippet_from_page(item) for item in data.get("pages", [])],
+                settings.rag_min_score,
+            ),
             identifiers=list(data.get("identifiers", [])),
             warnings=list(data.get("warnings", [])),
             available=True,

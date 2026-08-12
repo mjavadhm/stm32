@@ -11,6 +11,7 @@ Usage inside an agent:
     text = await llm.chat([{"role": "user", "content": "..."}])
 """
 
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -19,6 +20,8 @@ from functools import lru_cache
 from openai import AsyncOpenAI
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1)
@@ -51,6 +54,25 @@ def reset_clients() -> None:
     """Drop cached clients. Only needed by tests that patch settings."""
     get_llm_client.cache_clear()
     get_embedding_client.cache_clear()
+
+
+async def aclose_llm_clients() -> None:
+    """Close the cached provider clients and drop them from the cache.
+
+    These clients are process-wide singletons holding an httpx connection
+    pool, but a Celery worker runs every task in a fresh ``asyncio.run()``
+    loop. A pool opened inside task #1's loop is dead by the time task #2
+    starts ("Event loop is closed"), so the worker closes them per task and
+    lets the next one build its own.
+    """
+    for getter in (get_llm_client, get_embedding_client):
+        if not getter.cache_info().currsize:
+            continue
+        try:
+            await getter().close()
+        except Exception:  # pragma: no cover - best-effort cleanup
+            logger.debug("closing provider client failed", exc_info=True)
+    reset_clients()
 
 
 # --------------------------------------------------------------------------
@@ -131,6 +153,8 @@ class AgentLLM:
     model: str
 
     async def chat(self, messages: list[dict], **kwargs) -> str:
+        if settings.llm_max_tokens and "max_tokens" not in kwargs:
+            kwargs["max_tokens"] = settings.llm_max_tokens
         resp = await self.client.chat.completions.create(
             model=self.model,
             messages=messages,

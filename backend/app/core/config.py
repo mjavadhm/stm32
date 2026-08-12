@@ -35,6 +35,14 @@ class Settings(BaseSettings):
     # cache is invalidated immediately when the settings API writes.
     agent_settings_cache_ttl: float = 30.0
 
+    # Ceiling on generated tokens. 0 = leave it to the provider. Set it when
+    # running locally: a runaway generation costs minutes, not cents.
+    llm_max_tokens: int = 0
+    # A contract reply that fails validation is retried this many times, with
+    # the parser error fed back to the model, before the agent degrades
+    # (docs/architecture.md decision #3).
+    llm_contract_retries: int = 1
+
     # --- Embeddings (kept separate from LLM on purpose) ---
     # Decide before M2: changing the embedding model after building Qdrant
     # collections requires a full re-index (vector dimensions differ).
@@ -60,6 +68,24 @@ class Settings(BaseSettings):
     # Ceiling on the retrieved context injected into a prompt. Local models
     # have far smaller context windows than hosted ones.
     rag_context_max_chars: int = 12000
+    # Drop retrieved text/page snippets below this score. 0 = keep everything;
+    # scores are not comparable across collections until you calibrate them,
+    # so this stays off until an eval run tells you where the noise floor is.
+    rag_min_score: float = 0.0
+
+    # --- Build sandbox (M4) ---
+    # Compilation happens in a separate container that has no route to the
+    # internet, the database, or this API. The backend and the builder share
+    # the `workspaces` volume, so only a path crosses the wire, never source.
+    builder_url: str = "http://builder:9000"
+    build_timeout_seconds: float = 120.0
+    workspace_root: str = "/workspaces"
+    # ST's HAL and CMSIS sources. Downloaded into the build image (never
+    # committed to git) and mounted here read-only, so the scaffold can copy
+    # the drivers a project needs into the project itself -- the way
+    # STM32CubeMX does, and the reason a downloaded zip compiles on a machine
+    # that has never heard of this stack.
+    cube_sdk_root: str = "/opt/stm32cube/f4"
 
     # --- Infrastructure ---
     database_url: str = "postgresql+psycopg://stm32ai:stm32ai@postgres:5432/stm32ai"

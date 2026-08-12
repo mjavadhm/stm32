@@ -88,6 +88,19 @@ curl -X POST localhost:8000/rag/ask -H 'content-type: application/json' \
 
 چرایی دو استک جدا به‌جای یکی، و قرارداد نوشتن ایجنت‌های مبتنی بر ارجاع: [`docs/knowledge-base.md`](docs/knowledge-base.md)
 
+## کیفیت و ارزیابی
+
+```bash
+make test        # تست‌های آفلاین (بدون LLM و بدون PageVault)
+make lint        # ruff
+make kb-probe    # آیا بازیابی *با فیلتر family* هم چیزی برمی‌گرداند؟
+make eval        # اعداد کیفیت پایپ‌لاین طراحی (نیازمند LLM و PageVault زنده)
+```
+
+`make eval` روی سناریوهای [`backend/evals/cases.json`](backend/evals/cases.json) اجرا می‌شود و نرخ ارجاع‌دهی، ارجاع‌های ساختگی و تأخیر هر مرحله را گزارش می‌کند؛ خروجی هر اجرا در `backend/evals/results/` ذخیره می‌شود تا اثر تغییر پرامپت قابل مقایسه باشد.
+
+بازبینی کیفیت کد تا انتهای M3 و کارهای باقی‌مانده: [`docs/quality-review.md`](docs/quality-review.md)
+
 ## ساختار پروژه
 
 ```
@@ -101,10 +114,12 @@ curl -X POST localhost:8000/rag/ask -H 'content-type: application/json' \
 │   │   ├── workers/         # Celery
 │   │   ├── db/              # SQLModel / انجین دیتابیس
 │   │   └── rag/             # کلاینت HTTP پایگاه دانش (PageVault)
-│   └── tests/
+│   ├── tests/
+│   ├── scripts/             # ابزارهای تشخیصی (kb_probe)
+│   └── evals/               # سنجش کیفیت پایپ‌لاین طراحی
 ├── frontend/                # Next.js (داشبورد — M7 تکمیل می‌شود)
 ├── deploy/                  # override اتصال PageVault به شبکهٔ rag-net
-├── docs/                    # معماری + پایگاه دانش + پلن M3
+├── docs/                    # معماری + پایگاه دانش + پلن M3/M4 + بازبینی کیفیت
 ├── docker-compose.yml       # postgres + redis + qdrant + backend + worker + frontend (+ ollama)
 └── .github/workflows/ci.yml # Lint + Test
 ```
@@ -115,7 +130,7 @@ curl -X POST localhost:8000/rag/ask -H 'content-type: application/json' \
 - [x] **M1** — ارکستریتور و مدیریت تسک‌ها (LangGraph + Celery + روتر)
 - [ ] **M2** — پایگاه دانش و RAG — از طریق [PageVault](https://github.com/mjavadhm/pagevault) (اتصال برقرار است؛ باقی‌مانده: ingest مستندات و ارزیابی recall)
 - [x] **M3** — ایجنت‌های تحلیل و طراحی ([پلن](docs/m3-plan.md))
-- [ ] **M4** — ایجنت‌های تولید کد + کامپایل ایزوله
+- [ ] **M4** — ایجنت‌های تولید کد + کامپایل ایزوله ([پلن](docs/m4-plan.md))
 - [ ] **M5** — ایجنت‌های کیفیت (Review / Debug / Optimize / Test)
 - [ ] **M6** — مستندسازی و تحویل
 - [ ] **M7** — داشبورد تعاملی

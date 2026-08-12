@@ -1,0 +1,327 @@
+# M4 — تولید کد و کامپایل ایزوله: پلن اجرا
+
+**هدف.** خروجی M3 (`Architecture`) به یک پروژهٔ فریمور *کامپایل‌شونده* تبدیل شود:
+کانفیگ CubeMX (`.ioc`) + سورس کامل + باینری ساخته‌شده داخل یک کانتینر ایزوله،
+به‌همراه گزارش خطاهای کامپایلر و مصرف Flash/RAM.
+
+**تعریف «انجام‌شده».** درخواست «روی STM32F407 سنسور MPU6050 را با SPI1 و DMA بخوان»:
+
+1. `GET /projects/{id}` هفت تسک تمام‌شده نشان می‌دهد: `router`, `requirements`,
+   `datasheet`, `architecture`, **`cubemx`**, **`firmware`**, **`build`**.
+2. `GET /projects/{id}/download` یک zip می‌دهد که روی ماشین تمیز با `make` کامپایل می‌شود.
+3. `BuildResult.status == "ok"` و خروجی `arm-none-eabi-size` (Flash/RAM) ثبت شده است.
+4. حداقل **۳ از ۵** سناریوی `backend/evals/cases.json` در **تلاش اول** build تمیز می‌دهند.
+   این عدد پایه است، نه آرزو؛ اگر پایین‌تر بود یعنی پرامپت یا تمپلیت‌ها هنوز آماده نیستند.
+
+**خارج از دامنه.** Review / Debug / Optimize / Test (M5)، مستندسازی (M6)، داشبورد کامل (M7)،
+فلش روی برد واقعی و تست HIL.
+
+---
+
+## نگاه کلی فازها
+
+| فاز | نام | خروجی اصلی | وابسته به | اندازه |
+|---|---|---|---|---|
+| P0 | سندباکس ساخت + پروژهٔ طلایی | سرویس `builder` + `make golden` سبز | — | M |
+| P1 | قراردادهای M4 | مدل‌های جدید در `contracts.py` | — | S |
+| P2 | اسکلت قطعی پروژه | تمپلیت‌های Makefile / linker / startup | P1 | M |
+| P3 | CubeMX Agent | `CubeMXPlan` + رندر `.ioc` + اعتبارسنجی پین و DMA | P1، P2 | L |
+| P4 | Firmware Agent | `FirmwareBundle` قدم‌به‌قدم روی `implementation_order` | P2، P3 | L |
+| P5 | حلقهٔ ترمیم کراندار | build → diagnostics → patch → build | P0، P4 | M |
+| P6 | تحویل و سنجش | API فایل‌ها/زیپ/لاگ + تست‌ها + eval | همه | M |
+
+P0 و P1 به هم وابسته نیستند و می‌توانند موازی جلو بروند.
+
+---
+
+## P0 — اول سندباکس ساخت، بعد تولید کد
+
+**چرا اول؟** تنها معیار پذیرش M4 «کامپایل می‌شود» است. تا وقتی کامپایل قابل اتکا نباشد،
+کیفیت کدِ تولیدشده *قابل اندازه‌گیری نیست* و هر بهبود پرامپت حدس‌وگمان است.
+ضمناً این تنها بخش M4 است که ریسک فنی ناشناخته دارد (تول‌چین در کانتینر)؛
+ریسک ناشناخته باید اول باز شود، نه آخر.
+
+**تصمیم: سرویس `builder` روی HTTP، نه docker socket.**
+
+| گزینه | چرا نه / چرا آری |
+|---|---|
+| worker با `docker.sock` کانتینر بسازد | نیاز به سوکت privileged، در CI دردسر، تست‌پذیری صفر |
+| تول‌چین داخل ایمیج worker | ایمیج worker چند صد مگابایت سنگین‌تر، بدون ایزولاسیون واقعی |
+| **سرویس جدا با API داخلی** ✅ | ایزولاسیون شبکه، اجرای non-root، محدودیت منابع، و مهم‌تر: با `MockTransport` دقیقاً مثل `PageVaultClient` تست می‌شود |
+
+ساخته می‌شود:
+
+- `deploy/builder/Dockerfile` — پایهٔ `debian:bookworm-slim` + **نسخهٔ پین‌شدهٔ** Arm GNU Toolchain
+  (`arm-none-eabi-gcc`) + `make` + `cmake`. نسخه در `.env.example` و در لاگ build ثبت می‌شود؛
+  تغییر نسخهٔ تول‌چین یعنی تغییر خروجی، پس باید قابل ردیابی باشد.
+- `deploy/builder/server.py` — یک FastAPI کوچک: `POST /build {project_id, timeout}` → `BuildResult`،
+  `GET /health` → نسخهٔ gcc.
+- سرویس `builder` در `docker-compose.yml` با `networks: [internal]` (بدون دسترسی اینترنت)،
+  `mem_limit`، `cpus`، `read_only` و کاربر غیر روت؛ ولوم مشترک `workspaces:/workspaces`
+  بین `backend` / `worker` / `builder`.
+- `backend/app/build/client.py` — `BuilderClient` با همان الگوی `PageVaultClient`
+  (httpx، timeout، خطای مهار‌شده، قابل تزریق transport).
+- `backend/tests/fixtures/golden-f407-blinky/` — یک پروژهٔ **دست‌نویس و درست** برای STM32F407.
+
+**قاعده:** `make golden` این پروژهٔ طلایی را می‌سازد و در CI اجرا می‌شود.
+اگر روزی build ایجنت خراب شد، این تارگت می‌گوید تقصیر تول‌چین است یا کدِ تولیدشده.
+بدون آن، هر خطای کامپایل یک بحث بی‌پایان است.
+
+**محدودیت‌های سخت:** بدون شبکه، تایم‌اوت پیش‌فرض ۱۲۰ ثانیه، سقف حجم لاگ،
+مسیر ساخت فقط زیر `/workspaces/{project_id}`، پاک‌سازی خودکار فضای کار قدیمی.
+
+---
+
+## P1 — قراردادهای M4
+
+همهٔ مدل‌های زیر به `orchestrator/contracts.py` اضافه می‌شوند و از `Contract` ارث می‌برند
+(یعنی `schema_version` و `parse_stored` را رایگان دارند):
+
+| مدل | تولیدکننده | مصرف‌کننده |
+|---|---|---|
+| `PinAssignment(pin, signal, peripheral, mode, pull, speed, alternate, citation)` | cubemx | ioc renderer، firmware |
+| `ClockPlan(source, hse_hz, pll_m/n/p/q, sysclk_hz, hclk_hz, apb1_hz, apb2_hz)` | cubemx | ioc renderer، firmware |
+| `DmaConfig(stream, channel, direction, priority, mode, fifo)` | cubemx | firmware |
+| `PeripheralConfig(peripheral, mode, parameters, dma, nvic_priority, citation)` | cubemx | firmware |
+| `CubeMXPlan(mcu, board, clock, pins, peripherals, middlewares, rtos, warnings, citations, validated)` | cubemx | firmware، ioc |
+| `SourceFile(path, purpose, contents, step_order, citations, generated)` | firmware | build، تحویل |
+| `FirmwareBundle(files, notes, assumptions, citations, evidence)` | firmware | build |
+| `Diagnostic(file, line, column, severity, code, message)` | build | حلقهٔ ترمیم، M5 |
+| `BuildResult(status, exit_code, duration_ms, toolchain, artifacts, size, diagnostics, log_tail, attempt)` | build | UI، eval، M5 |
+
+نکته‌ها:
+
+- `SCHEMA_VERSION` فقط اگر مدل‌های موجود M3 عوض شوند بالا می‌رود؛ افزودن مدل جدید نیازی به bump ندارد.
+  `SUPPORTED_SCHEMA_VERSIONS` همان کاری را می‌کند که برای آن ساخته شد.
+- `Diagnostic` جداگانه تعریف می‌شود، نه رشتهٔ لاگ. حلقهٔ ترمیم M4 و Debug Agent در M5 هر دو
+  به خطای *ساخت‌یافته* نیاز دارند؛ اگر حالا لاگ خام ذخیره شود، M5 مجبور است دوباره پارس کند.
+- `validated: bool` روی `CubeMXPlan` همان منطق `verified` در M3 است: پلنی که با جدول پین/DMA
+  چک نشده، دروغ نمی‌گوید که چک شده.
+
+---
+
+## P2 — اسکلت پروژه قطعی است، نه تولیدی
+
+**بزرگ‌ترین اهرم کیفیت در کل M4 همین است:** مدل زبانی فقط کد *اپلیکیشن و درایور* می‌نویسد.
+فایل‌های حیاتیِ تول‌چین از تمپلیت رندر می‌شوند:
+
+```
+backend/app/codegen/
+├── templates/
+│   ├── Makefile.j2          # فلگ‌های -mcpu -mfpu، لیست سورس‌ها، تارگت‌های elf/bin/size
+│   ├── STM32F407VGTx_FLASH.ld
+│   ├── startup_stm32f407xx.s
+│   ├── main.c.j2            # فقط اسکلت + بخش‌های USER CODE
+│   ├── stm32f4xx_it.c.j2
+│   └── stm32f4xx_hal_msp.c.j2
+├── scaffold.py              # CubeMXPlan → درخت فایل پایه
+└── ioc.py                   # CubeMXPlan → فایل .ioc
+```
+
+دلیل: linker script و startup و فلگ‌های کامپایلر مسئلهٔ *حل‌شده و قطعی* هستند.
+سپردنشان به LLM یعنی وارد کردن نویز تصادفی به تنها چیزی که تعریف پذیرش M4 است.
+هر خطای build که از این فایل‌ها بیاید، تقصیر ما است نه مدل — و یک‌بار برای همیشه درست می‌شود.
+
+**قرارداد `USER CODE`:** تمام کد تولیدی مدل فقط داخل بلوک‌های
+`/* USER CODE BEGIN X */ ... /* USER CODE END X */` می‌نشیند تا پروژه با
+regenerate کردن CubeMX توسط کاربر نابود نشود. این را از روز اول رعایت کنیم،
+وگرنه در M5 که ترمیم و بازتولید داریم، تشخیص «کد چه‌کسی» غیرممکن می‌شود.
+
+---
+
+## P3 — CubeMX Agent
+
+**ورودی:** `Requirements` + `HardwareFindings` (با `evidence` و `citations` از M3).
+**خروجی:** `CubeMXPlan` + فایل `.ioc` + کد init قطعی.
+
+**تصمیم: به نصب CubeMX وابسته نشویم.**
+CLI رسمی STM32CubeMX جاوا می‌خواهد، دانلود لایسنس‌دار دارد و در ایمیج عمومی قابل حمل نیست.
+پس:
+
+- مسیر پیش‌فرض: `ioc.py` فایل `.ioc` را خودمان رندر می‌کنیم و `scaffold.py` کد init را از
+  تمپلیت می‌سازد. پایپ‌لاین بدون هیچ نصب اضافه‌ای کار می‌کند.
+- مسیر اختیاری: اگر کاربر `CUBEMX_CLI_PATH` را ست کرده باشد، همان `.ioc` به CubeMX داده می‌شود
+  تا کد HAL رسمی تولید شود. یک مسیر، دو حالت — نه دو پیاده‌سازی موازی.
+
+**اعتبارسنجی پین و DMA (بدون این، بقیه بی‌معنی است).**
+مدل با اطمینان کامل می‌گوید «SPI1_MOSI روی PA9 است». باید جایی باشد که بگوید نه.
+
+- `backend/app/codegen/data/stm32f407.json` — نگاشت پین → alternate function و جدول
+  درخواست‌های DMA، یک‌بار از RM0090 / دیتابیس CubeMX استخراج و کامیت می‌شود (با ذکر منبع در هدر فایل).
+- `validate_plan(plan)` هر `PinAssignment` و هر `DmaConfig` را چک می‌کند؛ نامعتبر → اصلاح خودکار
+  اگر گزینهٔ یکتا وجود دارد، وگرنه حذف + warning ماشین‌خوان + ثبت در `assumptions`.
+- MCU خارج از جدول → `validated=false` و هشدار صریح؛ پایپ‌لاین متوقف نمی‌شود.
+
+**دامنهٔ M4: فقط STM32F407 (و در صورت وقت، F103).**
+پوشش «همهٔ STM32ها» یعنی هیچ‌کدام درست کار نکند. خانوادهٔ دوم بعد از سبز شدن اولی.
+
+---
+
+## P4 — Firmware Agent
+
+**قدم‌به‌قدم روی `implementation_order`،** نه یک پرامپت غول‌پیکر برای کل پروژه.
+کاری که در M3 روی `ImplementationStep.files` و `.citations` و `Architecture.evidence` انجام شد
+دقیقاً برای همین بود.
+
+برای هر قدم، کانتکست ارسالی:
+
+1. `Requirements` (خلاصه) + ماژول مربوط به همان قدم از `Architecture`
+2. منابع همان قدم از `evidence` — نه همهٔ منابع پروژه
+3. `CubeMXPlan`: نام هندل‌ها (`hspi1`)، پین‌ها، استریم‌های DMA — تا مدل اسم اختراع نکند
+4. **فقط امضای** توابع و هدرهای فایل‌های تولیدشدهٔ قبلی، نه محتوای کاملشان (بودجهٔ توکن)
+
+قواعد:
+
+- هر فایل یک درخواست جداگانه با `request_contract`؛ پاسخ کوچک‌تر = خطای پارس کمتر و ترمیم ارزان‌تر.
+- هر HAL API استفاده‌شده باید یا در منابع بازیابی‌شده باشد یا در کد init تولیدشده؛
+  در غیر این صورت به `assumptions` می‌رود (کامپایلر هم بعداً همان را می‌گیرد).
+- `temperature=0` و بدون خلاقیت در نام فایل: مسیرها از `Architecture.file_tree` می‌آیند.
+- اگر `HardwareFindings.coverage` پایین باشد، پروژه ساخته می‌شود ولی برچسب «unverified» می‌خورد.
+  کدی که مبنای مستند ندارد باید *قابل تشخیص* باشد، نه ممنوع.
+
+---
+
+## P5 — حلقهٔ ترمیم، کراندار
+
+```
+firmware ──> build ──(ok)──> END
+               │
+               └──(failed && attempt < N)──> firmware(patch) ──> build
+```
+
+- `N` از `FIRMWARE_BUILD_RETRIES` می‌آید (پیش‌فرض ۲). حلقهٔ بی‌کران یعنی سوختن بودجهٔ توکن
+  روی خطایی که مدل بلد نیست حل کند.
+- ورودی ترمیم: حداکثر ۵ `Diagnostic` اول + فقط قطعهٔ کد اطراف هر خطا، نه کل فایل.
+- هر تلاش یک ردیف `TaskRun` جدا با ستون `attempt` است — همان بدهی‌ای که از M3 مانده بود
+  و حالا **مسدودکننده** است: بدون آن، دو تلاش روی یک ایجنت قابل تفکیک نیستند.
+  به‌همراه `UniqueConstraint(project_id, agent_name, attempt)`.
+- بعد از N تلاش: پروژه با `BuildResult.status="failed"` تحویل داده می‌شود، خطاها ساخت‌یافته ذخیره
+  می‌شوند و کار به Debug Agent در M5 پاس داده می‌شود. شکست، سکوت نیست.
+
+تغییرات لازم در فایل‌های موجود:
+
+| فایل | تغییر |
+|---|---|
+| `orchestrator/graph.py` | `_PIPELINES[full_project] += ["cubemx", "firmware", "build"]` + یال شرطی بازگشت به firmware |
+| `orchestrator/state.py` | کلیدهای `cubemx`, `firmware`, `build`, `attempt` |
+| `db/models.py` | `TaskRun.attempt` + unique constraint، جدول `Artifact` |
+| `core/config.py` | `BUILDER_URL`, `BUILD_TIMEOUT_SECONDS`, `WORKSPACE_DIR`, `FIRMWARE_BUILD_RETRIES`, `CUBEMX_CLI_PATH`, `TOOLCHAIN_VERSION` |
+| `docker-compose.yml` | سرویس `builder` + ولوم `workspaces` |
+| `Makefile` | `make builder-image`, `make golden` |
+
+**Alembic دیگر قابل تعویق نیست:** از این مایلستون به بعد داخل دیتابیس چیزی هست که
+ارزش نگه‌داشتن دارد (پروژه‌های تولیدشده). اضافه شدن `attempt` اولین migration واقعی است.
+
+---
+
+## P6 — تحویل و سنجش
+
+**API**
+
+| مسیر | کار |
+|---|---|
+| `GET /projects/{id}/files` | درخت فایل |
+| `GET /projects/{id}/files/{path}` | محتوای یک فایل |
+| `GET /projects/{id}/download` | zip پروژه |
+| `GET /projects/{id}/build` | آخرین `BuildResult` + دیاگنوستیک‌ها |
+| `POST /projects/{id}/build` | build دستی دوباره |
+
+**فرانت‌اند (حداقلی؛ زیبایی‌اش با M7):** درخت فایل، نمایش کد، پنل لاگ build با رنگ خطا/هشدار،
+دکمهٔ دانلود zip.
+
+**تست‌ها — همه آفلاین، بدون تول‌چین و بدون LLM**
+
+- رندر تمپلیت‌ها: خروجی Makefile و linker با snapshot مقایسه می‌شود.
+- `ioc.py`: `CubeMXPlan` مشخص → `.ioc` مورد انتظار.
+- `validate_plan`: پین غلط رد می‌شود، DMA نامعتبر warning می‌دهد، MCU ناشناس `validated=false`.
+- پارسر دیاگنوستیک: روی لاگ واقعی gcc که در `tests/fixtures/gcc_errors.txt` کامیت شده.
+- Firmware Agent با `FakeLLM`: هر قدم یک فایل، مسیرها از `file_tree`، ارجاع‌ها از `evidence`.
+- `BuilderClient` با `MockTransport`: موفق، شکست، تایم‌اوت، سرویس خاموش.
+- حلقهٔ ترمیم: با build همیشه‌شکست، دقیقاً `N+1` بار build صدا زده می‌شود، نه بیشتر.
+- تست دود با تول‌چین واقعی، جدا و علامت‌دار (`make golden`) تا `make test` سریع بماند.
+
+**eval گسترش پیدا می‌کند** (`backend/evals/run_eval.py`): نرخ build موفق در تلاش اول،
+تعداد warning کامپایلر، مصرف Flash/RAM، تعداد تلاش‌های ترمیم، زمان هر مرحله.
+همان فایل نتایج در `evals/results/` تا اثر هر تغییر پرامپت روی *کامپایل‌شدن* دیده شود.
+
+---
+
+## ترتیب و دلیلش
+
+```
+P0 سندباکس ─┐
+            ├─> P2 اسکلت ─> P3 CubeMX ─> P4 Firmware ─> P5 ترمیم ─> P6 تحویل
+P1 قرارداد ─┘
+```
+
+سندباکس اول، چون تنها ریسک ناشناختهٔ مایلستون است و معیار پذیرش بقیه را می‌سازد.
+قراردادها موازی، چون بقیه به آن‌ها ارجاع می‌دهند ولی به چیزی وابسته نیستند.
+حلقهٔ ترمیم *بعد* از firmware، نه همراهش: تا وقتی نرخ موفقیت تلاش اول را ندانیم،
+ترمیم فقط یک لایهٔ پنهان‌کنندهٔ ضعف است.
+
+## ریسک‌ها و پاسخشان
+
+| ریسک | پاسخ |
+|---|---|
+| CubeMX CLI قابل حمل نیست | رندر `.ioc` و کد init به‌صورت قطعی؛ CLI فقط مسیر اختیاری |
+| نگاشت پین/DMA توهمی | جدول ثابت `stm32f407.json` + `validate_plan`؛ دامنه محدود به یک خانواده |
+| کامپایل ناموفق پایان‌ناپذیر | حلقهٔ کراندار + تحویل شکست به‌صورت ساخت‌یافته |
+| بودجهٔ توکن روی پروژهٔ بزرگ | تولید فایل‌به‌فایل، کانتکست فقط امضاها، منابع فقط همان قدم |
+| خروجی غیرقطعی | `temperature=0`، اسکلت قطعی، کش build بر اساس هش فایل‌ها، eval تکرارپذیر |
+| فرار از سندباکس / مصرف منابع | بدون شبکه، non-root، read-only، سقف حافظه و زمان، مسیر محدود |
+| بزرگ شدن ایمیج و کندی CI | ایمیج `builder` جدا و کش‌شده؛ `make test` هیچ‌وقت تول‌چین لازم ندارد |
+
+## بدهی‌ای که این مایلستون تسویه می‌کند
+
+- `TaskRun.attempt` + unique constraint (از M3 مانده بود، حالا مسدودکننده است)
+- اولین migration واقعی Alembic
+- `AgentCall` برای رصد مصرف توکن — با حلقهٔ ترمیم، هزینهٔ هر تلاش باید دیده شود
+- ingest واقعی مستندات در PageVault: بدون آن `evidence` تهی است و کد بی‌پشتوانه تولید می‌شود
+
+---
+
+## پیوست: تصمیم‌های اجرایی (به‌روزرسانی حین کار)
+
+این بخش حین پیاده‌سازی نوشته می‌شود تا انحراف‌ها از پلن اولیه ثبت شوند.
+
+### P2 — درایورهای ST از کجا می‌آیند؟
+
+**تصمیم:** پروژه‌های تولیدشده روی HAL رسمی ST ساخته می‌شوند (نه رجیستر خام)،
+ولی سورس HAL/CMSIS **داخل این ریپو نگهداری نمی‌شود**.
+
+**چرا HAL و نه رجیستر خام:** کامپایلر خطای HAL را می‌گیرد ولی محاسبهٔ اشتباه
+یک بیت‌فیلد را نمی‌گیرد. کل ایدهٔ M4 این است که «کامپایل شدن» دروازهٔ کیفیت
+باشد؛ کد رجیستری این دروازه را بی‌اثر می‌کند چون خطایش در زمان اجرا روی برد
+ظاهر می‌شود، نه در لاگ بیلد. ضمناً خروجی باید برای کسی که CubeMX دیده آشنا
+باشد.
+
+**چرا نه داخل گیت:** حدود ۱۰ مگابایت C شخص ثالث که هیچ‌وقت ویرایشش نمی‌کنیم،
+با لایسنس و چرخهٔ انتشار خودش. وندور کردنش یعنی مرور دیف‌های ST در PRهای ما
+تا ابد.
+
+**راه‌حل:**
+
+1. `deploy/builder/fetch-sdk.sh` هنگام `docker build` سورس‌ها را از مخازن
+   رسمی ST می‌گیرد (`stm32f4xx_hal_driver`, `cmsis_device_f4`, `cmsis_core`)
+   و با چیدمان CubeMX در `/opt/stm32cube/f4` می‌گذارد. رفرنس‌ها پین شده‌اند و
+   با `--build-arg HAL_REF=...` قابل تغییرند.
+2. ولوم `cube_sdk` هنگام اولین اجرای کانتینر از ایمیج پر می‌شود و به‌صورت
+   read-only به backend و worker وصل است.
+3. `app/codegen/sdk.py` برای هر پروژه فقط درایورهای لازم را **داخل خود پروژه**
+   کپی می‌کند — دقیقاً کاری که CubeMX می‌کند و همان چیزی که باعث می‌شود زیپ
+   دانلودشده روی ماشین کاربر کامپایل شود.
+
+**نتیجه برای آفلاین بودن:** تنها لحظه‌ای که اینترنت لازم است `make
+builder-image` است. تولید پروژه، کامپایل و دانلود همگی آفلاین‌اند؛ کانتینر
+بیلدر همچنان روی شبکهٔ `internal` بدون مسیر خروجی است.
+
+**هزینهٔ عملیاتی:** داکر ولوم را فقط وقتی خالی است از ایمیج پر می‌کند، پس بعد
+از ساخت مجدد ایمیج با رفرنس جدید باید `make sdk-refresh` زد. `make sdk-check`
+نسخهٔ نصب‌شده را چاپ می‌کند و یک کپی واقعی داخل یک workspace موقت انجام می‌دهد.
+
+### P2 — بدون jinja2
+
+قالب‌ها با یک رندرر ~۴۰ خطی و نشانگرهای `{{PLACEHOLDER}}` تولید می‌شوند، نه با
+jinja2. افزودن یک وابستگی به `requirements.txt` یعنی اجبار به
+`docker compose build backend` برای همه، در ازای چیزی که در این حجم قالب
+ارزشش را ندارد. (انحراف از نام‌گذاری `.j2` در پلن اولیه.)
