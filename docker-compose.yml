@@ -14,6 +14,14 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    networks:
+      default:
+        aliases:
+          # Unambiguous DNS name. The service name `postgres` collides on
+          # rag-net: PageVault's stack names its default network `rag-net`
+          # and exposes its own `postgres` there, and any container on both
+          # networks (backend, worker) may resolve that one instead.
+          - stm32-postgres
 
   redis:
     image: redis:7-alpine

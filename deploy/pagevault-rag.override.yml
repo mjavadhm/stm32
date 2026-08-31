@@ -17,23 +17,23 @@
 #
 # Relative build contexts resolve against the FIRST -f file, so pointing at
 # this file from another directory is safe.
+#
+# NOTE: this PageVault checkout declares its DEFAULT network as the external
+# `rag-net`, so every PageVault service is already reachable on rag-net under
+# its service name (api, postgres, redis, ...). The alias below therefore
+# rides on the `default` key -- a second `rag-net:` key would collide with it
+# in the merge and the alias would be silently dropped.
 
 services:
   api:
     networks:
-      # Mapping form (not a list): the alias below requires it.
-      default: {}
-      rag-net:
+      default:
         aliases:
-          # The hostname the STM32 backend uses (PAGEVAULT_URL). In its own
-          # stack this service is called `api`, which is far too generic a
-          # name to expose on a shared network.
+          # The hostname the STM32 backend uses (PAGEVAULT_URL). The service
+          # name `api` is far too generic to depend on: it collides with any
+          # other api-named container on the shared network.
           - pagevault-api
     ports:
       # Remapped: the STM32 backend already owns host port 8000. Inside the
       # network the port is still 8000, so PAGEVAULT_URL never changes.
       - "8100:8000"
-
-networks:
-  rag-net:
-    external: true
