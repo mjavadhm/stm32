@@ -77,3 +77,27 @@ class GenerationSetting(SQLModel, table=True):
     id: int = Field(default=1, primary_key=True)
     pin_selection_policy: str = PinSelectionPolicy.deterministic.value
     updated_at: datetime = Field(default_factory=utcnow)
+
+
+class Conversation(SQLModel, table=True):
+    """A multi-turn chat session with the knowledge base (agentic RAG)."""
+
+    id: str = Field(default_factory=lambda: uuid.uuid4().hex, primary_key=True)
+    # Set from the first user message when the client sends no title.
+    title: str = ""
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
+class Message(SQLModel, table=True):
+    """One chat turn. `payload` carries agent metadata (citations, warnings,
+    searches) as JSON for assistant messages; NULL for user messages."""
+
+    # Integer PK on purpose: chat turns are read in insertion order and a
+    # uuid does not give that.
+    id: int | None = Field(default=None, primary_key=True)
+    conversation_id: str = Field(foreign_key="conversation.id", index=True)
+    role: str  # user | assistant
+    content: str
+    payload: str | None = None
+    created_at: datetime = Field(default_factory=utcnow)

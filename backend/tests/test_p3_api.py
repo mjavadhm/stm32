@@ -74,7 +74,7 @@ def test_existing_pre_alembic_database_is_stamped_then_upgraded(tmp_path: Path):
         ).one()
         revision = connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
     assert row == ("existing", "deterministic")
-    assert revision == "0002_p3_cubemx"
+    assert revision == "0003_chat"
 
 
 def test_generation_setting_persists_and_project_policy_is_frozen(tmp_path: Path):

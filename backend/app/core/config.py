@@ -73,6 +73,11 @@ class Settings(BaseSettings):
     # so this stays off until an eval run tells you where the noise floor is.
     rag_min_score: float = 0.0
 
+    # --- Agentic document chat (agentic RAG) ---
+    # The chat agent plans its own retrieval: per question it may run at most
+    # this many searches before it has to answer with what it has collected.
+    chat_max_searches: int = 3
+
     # --- Build sandbox (M4) ---
     # Compilation happens in a separate container that has no route to the
     # internet, the database, or this API. The backend and the builder share

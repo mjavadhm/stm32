@@ -14,6 +14,7 @@ Usage inside an agent:
 import logging
 import threading
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -161,6 +162,28 @@ class AgentLLM:
             **kwargs,
         )
         return resp.choices[0].message.content or ""
+
+    async def stream(self, messages: list[dict], **kwargs) -> AsyncIterator[str]:
+        """Yield the reply token by token.
+
+        Only the final answer of a chat turn is streamed; planning steps
+        stay on chat() so a malformed JSON action never reaches the UI as
+        half-rendered text.
+        """
+        if settings.llm_max_tokens and "max_tokens" not in kwargs:
+            kwargs["max_tokens"] = settings.llm_max_tokens
+        stream = await self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            stream=True,
+            **kwargs,
+        )
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
 
 
 def get_agent_llm(agent_name: str) -> AgentLLM:

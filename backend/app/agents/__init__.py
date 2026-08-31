@@ -18,6 +18,7 @@ KNOWN_AGENTS: list[str] = [
     "requirements",
     "architecture",
     "datasheet",
+    "chat",
     "cubemx",
     "firmware",
     "review",

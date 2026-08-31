@@ -202,11 +202,16 @@ export default function Home() {
     <main className="container wide">
       <header className="header">
         <h1>دستیار هوشمند مهندسی STM32</h1>
-        <span className={`status status-${health}`}>
-          {health === "checking" && "در حال بررسی…"}
-          {health === "ok" && "بک‌اند متصل ✅"}
-          {health === "down" && "بک‌اند در دسترس نیست ❌"}
-        </span>
+        <div className="header-actions">
+          <a className="nav-link" href="/chat">
+            گفتگو با مستندات →
+          </a>
+          <span className={`status status-${health}`}>
+            {health === "checking" && "در حال بررسی…"}
+            {health === "ok" && "بک‌اند متصل ✅"}
+            {health === "down" && "بک‌اند در دسترس نیست ❌"}
+          </span>
+        </div>
       </header>
 
       {/* درخواست جدید */}
