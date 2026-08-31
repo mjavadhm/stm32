@@ -3,6 +3,7 @@ uvicorn[standard]>=0.30
 pydantic-settings>=2.4
 openai>=1.40            # OpenAI-compatible client (works with Ollama /v1 too)
 sqlmodel>=0.0.21
+alembic>=1.13
 psycopg[binary]>=3.2
 celery[redis]>=5.4
 redis>=5.0

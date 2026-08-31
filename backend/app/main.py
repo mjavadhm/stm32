@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import agents, health, projects, rag
+from app.api.routes import agents, generation, health, projects, rag
 from app.core.config import settings
 from app.db.session import init_db
 from app.rag import close_rag_client
@@ -43,4 +43,5 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(projects.router)
 app.include_router(agents.router)
+app.include_router(generation.router)
 app.include_router(rag.router)

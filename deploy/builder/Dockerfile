@@ -45,6 +45,22 @@ RUN chmod +x /usr/local/bin/fetch-sdk \
        DEST="$CUBE_SDK_ROOT" \
        fetch-sdk
 
+# The per-part pin tables.
+#
+# Same reasoning as the drivers above, for the one fact they do not contain:
+# which pin can carry which signal, and at which alternate-function number.
+# It is downloaded here rather than committed, and it lands inside the same
+# `cube_sdk` volume, so the backend already sees it read-only -- no new mount
+# for the data itself. `make devices` converts it once into the compact
+# tables the planner validates against.
+ARG MODM_DEVICES_REF=develop
+ENV DEVICE_XML_ROOT=/opt/stm32cube/modm-devices
+COPY fetch-devices.sh /usr/local/bin/fetch-devices
+RUN chmod +x /usr/local/bin/fetch-devices \
+    && MODM_DEVICES_REF="$MODM_DEVICES_REF" \
+       DEST="$DEVICE_XML_ROOT" \
+       fetch-devices
+
 WORKDIR /srv
 
 COPY requirements.txt .

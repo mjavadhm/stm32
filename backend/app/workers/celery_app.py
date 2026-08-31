@@ -128,6 +128,8 @@ async def _run_pipeline(project_id: str) -> str:
         session.add(project)
         session.commit()
         user_request = project.user_request
+        project_name = project.name
+        pin_selection_policy = project.pin_selection_policy
 
     # Only the router is known up front -- it is what decides the request
     # type, and therefore which agents run after it. The sequence is extended
@@ -136,7 +138,9 @@ async def _run_pipeline(project_id: str) -> str:
 
     state = {
         "project_id": project_id,
+        "project_name": project_name,
         "user_request": user_request,
+        "pin_selection_policy": pin_selection_policy,
     }
 
     # The agent currently believed to be executing. `stream_mode="updates"`

@@ -4,11 +4,14 @@ import { FormEvent, useCallback, useEffect, useState } from "react";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
+type PinSelectionPolicy = "deterministic" | "explicit" | "llm";
+
 type ProjectSummary = {
   id: string;
   name: string;
   request_type: string;
   status: string;
+  pin_selection_policy: PinSelectionPolicy;
   error: string | null;
   created_at: string;
   updated_at: string;
@@ -33,6 +36,10 @@ type AgentSetting = {
   model: string;
   is_override: boolean;
   enabled: boolean;
+};
+
+type GenerationSetting = {
+  pin_selection_policy: PinSelectionPolicy;
 };
 
 const STATUS_FA: Record<string, string> = {
@@ -62,10 +69,14 @@ export default function Home() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<ProjectDetail | null>(null);
   const [agents, setAgents] = useState<AgentSetting[]>([]);
+  const [generation, setGeneration] = useState<GenerationSetting>({
+    pin_selection_policy: "deterministic",
+  });
   const [modelEdits, setModelEdits] = useState<Record<string, string>>({});
 
   const [name, setName] = useState("");
   const [request, setRequest] = useState("");
+  const [pinPolicy, setPinPolicy] = useState<"default" | PinSelectionPolicy>("default");
   const [busy, setBusy] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -97,11 +108,21 @@ export default function Home() {
     }
   }, []);
 
+  const refreshGeneration = useCallback(async () => {
+    try {
+      const r = await fetch(`${API_URL}/generation/settings`);
+      if (r.ok) setGeneration(await r.json());
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
   // Initial load
   useEffect(() => {
     refreshProjects();
     refreshAgents();
-  }, [refreshProjects, refreshAgents]);
+    refreshGeneration();
+  }, [refreshProjects, refreshAgents, refreshGeneration]);
 
   // Live polling (projects list + selected project detail)
   useEffect(() => {
@@ -121,12 +142,17 @@ export default function Home() {
       const r = await fetch(`${API_URL}/projects`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: name.trim(), request: request.trim() }),
+        body: JSON.stringify({
+          name: name.trim(),
+          request: request.trim(),
+          pin_selection_policy: pinPolicy === "default" ? null : pinPolicy,
+        }),
       });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const created: ProjectSummary = await r.json();
       setName("");
       setRequest("");
+      setPinPolicy("default");
       setSelectedId(created.id);
       await refreshProjects();
       await refreshDetail(created.id);
@@ -163,6 +189,15 @@ export default function Home() {
     await refreshAgents();
   }
 
+  async function saveGenerationPolicy(policy: PinSelectionPolicy) {
+    await fetch(`${API_URL}/generation/settings`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pin_selection_policy: policy }),
+    });
+    await refreshGeneration();
+  }
+
   return (
     <main className="container wide">
       <header className="header">
@@ -189,6 +224,22 @@ export default function Home() {
             rows={3}
             placeholder="درخواست مهندسی… مثلاً: خواندن سنسور MPU6050 با SPI و DMA روی STM32F407"
           />
+          <label className="field-label">
+            سیاست انتخاب پایه
+            <select
+              value={pinPolicy}
+              onChange={(e) =>
+                setPinPolicy(e.target.value as "default" | PinSelectionPolicy)
+              }
+            >
+              <option value="default">
+                پیش‌فرض سراسری ({generation.pin_selection_policy})
+              </option>
+              <option value="deterministic">قطعی (پیشنهادی)</option>
+              <option value="explicit">فقط پایه‌های صریح</option>
+              <option value="llm">انتخاب ایجنت از گزینه‌های معتبر</option>
+            </select>
+          </label>
           <button type="submit" disabled={busy}>
             {busy ? "در حال ارسال…" : "اجرای خط لوله"}
           </button>
@@ -218,6 +269,7 @@ export default function Home() {
                 <div className="project-row muted small">
                   <span>{TYPE_FA[p.request_type] ?? p.request_type}</span>
                   <span>{new Date(p.created_at + "Z").toLocaleTimeString("fa-IR")}</span>
+                  <span>{p.pin_selection_policy}</span>
                 </div>
               </li>
             ))}
@@ -278,7 +330,22 @@ export default function Home() {
 
       {/* تنظیمات ایجنت‌ها */}
       <section className="card">
-        <h2>تنظیمات ایجنت‌ها</h2>
+        <div className="settings-heading">
+          <h2>تنظیمات ایجنت‌ها</h2>
+          <label className="inline-setting">
+            سیاست سراسری پایه
+            <select
+              value={generation.pin_selection_policy}
+              onChange={(e) =>
+                saveGenerationPolicy(e.target.value as PinSelectionPolicy)
+              }
+            >
+              <option value="deterministic">قطعی (پیشنهادی)</option>
+              <option value="explicit">فقط پایه‌های صریح</option>
+              <option value="llm">انتخاب ایجنت از گزینه‌های معتبر</option>
+            </select>
+          </label>
+        </div>
         <p className="muted small">
           مدل هر ایجنت از دیتابیس خوانده می‌شود؛ خالی‌گذاشتن یعنی استفاده از مدل پیش‌فرض
           (LLM_MODEL).

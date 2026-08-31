@@ -4,7 +4,7 @@ The router is the first node, not a step hidden inside the API handler. Every
 run therefore starts the same way, and the routing decision is visible in the
 progress view like any other agent.
 
-    router ─┬─ full_project ─> requirements -> datasheet -> architecture -> END
+    router ─┬─ full_project ─> requirements -> datasheet -> architecture -> cubemx -> END
             └─ debug/optimize/test ─> mock_copilot -> END
 
 `_PIPELINES` is the single source of truth for both the graph edges and the
@@ -16,6 +16,7 @@ those two copies were one edit away from disagreeing.
 from langgraph.graph import END, StateGraph
 
 from app.agents.architecture import architecture_node
+from app.agents.cubemx import cubemx_node
 from app.agents.datasheet import datasheet_node
 from app.agents.mock import mock_copilot
 from app.agents.requirements import requirements_node
@@ -27,7 +28,7 @@ ROUTER_NODE = "router"
 
 # request_type -> the agents that run after the router, in order.
 _PIPELINES: dict[str, list[str]] = {
-    RequestType.full_project.value: ["requirements", "datasheet", "architecture"],
+    RequestType.full_project.value: ["requirements", "datasheet", "architecture", "cubemx"],
     RequestType.debug.value: ["mock_copilot"],
     RequestType.optimize.value: ["mock_copilot"],
     RequestType.test.value: ["mock_copilot"],
@@ -38,6 +39,7 @@ _NODES = {
     "requirements": requirements_node,
     "datasheet": datasheet_node,
     "architecture": architecture_node,
+    "cubemx": cubemx_node,
     "mock_copilot": mock_copilot,  # replaced by real agents in M5
 }
 

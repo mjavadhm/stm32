@@ -45,8 +45,13 @@ services:
       - workspaces:/workspaces
       # ST's HAL/CMSIS sources, downloaded into the builder image and shared
       # read-only. The scaffold copies the drivers each project needs out of
-      # here, so git carries none of them.
+      # here, so git carries none of them. The pin tables ride along in the
+      # same volume, under modm-devices/.
       - cube_sdk:/opt/stm32cube:ro
+      # The per-part tables converted from those pin tables, and later the
+      # chips imported from the admin panel. Writable, and deliberately not
+      # inside the image: an imported chip must survive a rebuild.
+      - device_data:/var/lib/stm32ai/devices
     networks:
       - default
       - rag-net
@@ -74,6 +79,7 @@ services:
       - ./backend:/app
       - workspaces:/workspaces
       - cube_sdk:/opt/stm32cube:ro
+      - device_data:/var/lib/stm32ai/devices
     networks:
       - default
       - rag-net
@@ -135,6 +141,10 @@ volumes:
   # Generated projects, one directory per project id. Shared by the backend,
   # the worker and the builder.
   workspaces:
+  # Per-part pin tables, converted from the vendor data by `make devices`.
+  # Also where a chip imported from the panel will land, which is why it is a
+  # volume the backend can write to rather than something baked into an image.
+  device_data:
   # ST's HAL/CMSIS sources, populated from the builder image. Delete it with
   # `make sdk-refresh` after rebuilding the image with different refs.
   cube_sdk:

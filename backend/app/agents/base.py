@@ -11,7 +11,7 @@ agents stay testable with a fake and this module never imports a provider.
 """
 
 import logging
-from typing import Any, Protocol, TypeVar
+from typing import Any, Protocol
 
 from pydantic import BaseModel
 
@@ -19,9 +19,6 @@ from app.core.config import settings
 from app.orchestrator.contracts import ContractError, parse_model
 
 logger = logging.getLogger(__name__)
-
-TContract = TypeVar("TContract", bound=BaseModel)
-
 
 class ChatLLM(Protocol):
     async def chat(self, messages: list[dict], **kwargs: Any) -> str: ...
@@ -38,7 +35,7 @@ _REPAIR_PROMPT = (
 _ECHO_LIMIT = 2000
 
 
-async def request_contract(
+async def request_contract[TContract: BaseModel](
     llm: ChatLLM,
     model: type[TContract],
     messages: list[dict],

@@ -86,6 +86,14 @@ class Settings(BaseSettings):
     # STM32CubeMX does, and the reason a downloaded zip compiles on a machine
     # that has never heard of this stack.
     cube_sdk_root: str = "/opt/stm32cube/f4"
+    # Which pin can carry which signal, at which alternate-function number.
+    # The one hardware fact ST does not ship with the HAL, downloaded into
+    # the build image next to the drivers and read from the same volume.
+    device_xml_root: str = "/opt/stm32cube/modm-devices"
+    # The compact tables converted from it by `make devices`, plus anything
+    # imported later from the admin panel. Writable, and on its own volume so
+    # an imported chip survives an image rebuild.
+    device_data_root: str = "/var/lib/stm32ai/devices"
 
     # --- Infrastructure ---
     database_url: str = "postgresql+psycopg://stm32ai:stm32ai@postgres:5432/stm32ai"

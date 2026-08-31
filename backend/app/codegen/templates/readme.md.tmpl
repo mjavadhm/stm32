@@ -1,0 +1,50 @@
+# {{TARGET}}
+
+{{SUMMARY}}
+
+Generated for **{{MCU}}** by the STM32 engineering assistant.
+
+## Build
+
+The only requirement is an `arm-none-eabi` toolchain and `make`:
+
+```bash
+make            # -> build/{{TARGET}}.elf, .hex, .bin
+make clean
+```
+
+On Fedora: `sudo dnf install arm-none-eabi-gcc-cs arm-none-eabi-newlib make`.
+On Debian/Ubuntu: `sudo apt install gcc-arm-none-eabi make`.
+
+## Flash
+
+```bash
+st-flash write build/{{TARGET}}.bin 0x8000000
+# or
+openocd -f interface/stlink.cfg -f target/stm32f4x.cfg \
+  -c "program build/{{TARGET}}.elf verify reset exit"
+```
+
+## Layout
+
+```
+Core/Inc          headers, including the HAL configuration
+Core/Src          main.c, interrupt handlers, low-level init
+Core/Startup      ST's startup code for this part
+Drivers           ST's HAL and CMSIS sources, copied in full
+{{LDSCRIPT}}      memory map for this part
+```
+
+## Regenerating
+
+Everything outside the `USER CODE BEGIN` / `USER CODE END` markers is
+generated from the design plan and is overwritten when the project is
+regenerated. Code inside the markers is preserved.
+
+## Clock
+
+{{CLOCK_SUMMARY}}
+
+## Peripherals
+
+{{PERIPHERAL_SUMMARY}}

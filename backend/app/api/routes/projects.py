@@ -2,7 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
-from app.db.models import Project, RunStatus, TaskRun, utcnow
+from app.api.routes.generation import effective_generation_settings
+from app.db.models import PinSelectionPolicy, Project, RunStatus, TaskRun, utcnow
 from app.db.session import get_session
 from app.orchestrator.graph import agent_sequence_for
 from app.workers.celery_app import run_pipeline
@@ -13,6 +14,7 @@ router = APIRouter(prefix="/projects", tags=["projects"])
 class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     request: str = Field(min_length=1)
+    pin_selection_policy: PinSelectionPolicy | None = None
 
 
 def _project_summary(project: Project) -> dict:
@@ -21,6 +23,7 @@ def _project_summary(project: Project) -> dict:
         "name": project.name,
         "request_type": project.request_type,
         "status": project.status,
+        "pin_selection_policy": project.pin_selection_policy,
         "error": project.error,
         "created_at": project.created_at,
         "updated_at": project.updated_at,
@@ -42,7 +45,16 @@ def create_project(
     Only the router task is pre-created, because the remaining agents are not
     known until the router has run.
     """
-    project = Project(name=payload.name, user_request=payload.request)
+    policy = (
+        payload.pin_selection_policy.value
+        if payload.pin_selection_policy is not None
+        else effective_generation_settings(session).pin_selection_policy
+    )
+    project = Project(
+        name=payload.name,
+        user_request=payload.request,
+        pin_selection_policy=policy,
+    )
     session.add(project)
     session.commit()
     session.refresh(project)

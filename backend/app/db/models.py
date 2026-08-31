@@ -26,12 +26,21 @@ class RunStatus(StrEnum):
     cancelled = "cancelled"
 
 
+class PinSelectionPolicy(StrEnum):
+    deterministic = "deterministic"
+    explicit = "explicit"
+    llm = "llm"
+
+
 class Project(SQLModel, table=True):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex, primary_key=True)
     name: str
     user_request: str
     request_type: RequestType = RequestType.full_project
     status: RunStatus = RunStatus.pending
+    # Resolved at creation time. Later global setting changes deliberately do
+    # not rewrite existing projects.
+    pin_selection_policy: str = PinSelectionPolicy.deterministic.value
     error: str | None = None
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
@@ -59,4 +68,12 @@ class AgentSetting(SQLModel, table=True):
     agent_name: str = Field(primary_key=True)
     model: str | None = None
     enabled: bool = True
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
+class GenerationSetting(SQLModel, table=True):
+    """Singleton defaults for deterministic generation policy."""
+
+    id: int = Field(default=1, primary_key=True)
+    pin_selection_policy: str = PinSelectionPolicy.deterministic.value
     updated_at: datetime = Field(default_factory=utcnow)

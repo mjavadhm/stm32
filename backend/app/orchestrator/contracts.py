@@ -16,7 +16,7 @@ Two rules make this survive later milestones:
 
 import json
 import re
-from typing import Any, TypeVar
+from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -255,12 +255,17 @@ class ClockPlan(BaseModel):
 
 
 class DmaConfig(BaseModel):
+    # Peripheral request name from the device table, for example SPI1_RX.
+    # The default keeps TaskRun rows written before P3 readable; validation
+    # fills it from direction when that is unambiguous.
+    request: str = ""
     stream: str = ""  # DMA2_Stream3
     channel: int | None = None
     direction: str = ""  # peripheral_to_memory | memory_to_peripheral
     priority: str = "low"
     mode: str = "normal"  # normal | circular
     fifo: bool = False
+    nvic_priority: int | None = None
 
 
 class PeripheralConfig(BaseModel):
@@ -457,9 +462,6 @@ class BuildResult(Contract):
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
-TContract = TypeVar("TContract", bound=BaseModel)
-
-
 def extract_json(text: str) -> dict[str, Any]:
     """Find the JSON object in an LLM reply.
 
@@ -513,7 +515,7 @@ def extract_json(text: str) -> dict[str, Any]:
     raise ContractError("no JSON object found in reply")
 
 
-def parse_model(model: type[TContract], text: str) -> TContract:
+def parse_model[TContract: BaseModel](model: type[TContract], text: str) -> TContract:
     """Parse an LLM reply into a contract model."""
     data = extract_json(text)
     data.setdefault("schema_version", SCHEMA_VERSION)
@@ -523,7 +525,9 @@ def parse_model(model: type[TContract], text: str) -> TContract:
         raise ContractError(f"{model.__name__} validation failed: {exc}") from exc
 
 
-def parse_stored(model: type[TContract], data: dict[str, Any] | None) -> TContract:
+def parse_stored[TContract: BaseModel](
+    model: type[TContract], data: dict[str, Any] | None
+) -> TContract:
     """Validate a contract that was produced earlier, not by an LLM.
 
     Used when a node reads what a previous node wrote (and, from M4 on, when

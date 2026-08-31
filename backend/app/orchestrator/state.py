@@ -13,7 +13,9 @@ from typing import Any, TypedDict
 class PipelineState(TypedDict, total=False):
     # --- set by the API before the graph starts ---
     project_id: str
+    project_name: str
     user_request: str
+    pin_selection_policy: str
 
     # --- router node (M3) ---
     request_type: str
@@ -23,6 +25,8 @@ class PipelineState(TypedDict, total=False):
     requirements: dict[str, Any]
     hardware: dict[str, Any]
     architecture: dict[str, Any]
+    cubemx: dict[str, Any]
+    cubemx_artifacts: dict[str, Any]
 
     # --- copilot path (still mocked until M5) ---
     copilot_result: str
