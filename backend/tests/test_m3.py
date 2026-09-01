@@ -104,35 +104,59 @@ ARCHITECTURE_REPLY = json.dumps(
     }
 )
 
-UNIFIED_RESPONSE = {
-    "query": "q",
-    "strategy": "quota",
-    "symbols": [
-        {
-            "name": "HAL_SPI_Transmit_DMA",
-            "kind": "function",
-            "signature": "HAL_StatusTypeDef HAL_SPI_Transmit_DMA(...)",
-            "path": "stm32f4xx_hal_spi.c",
-            "line_start": 1420,
-            "line_end": 1490,
-            "doc": "Transmit with DMA.",
-            "chunk_id": "c1",
-            "collection": "stm32",
-            "match": "exact",
-            "matched_term": "HAL_SPI_Transmit",
-        }
-    ],
-    "type_context": [],
-    "chunks": [],
-    "pages": [],
-    "identifiers": [],
-    "fused": [],
-    "warnings": [],
+SYMBOL = {
+    "name": "HAL_SPI_Transmit_DMA",
+    "kind": "function",
+    "signature": "HAL_StatusTypeDef HAL_SPI_Transmit_DMA(...)",
+    "path": "stm32f4xx_hal_spi.c",
+    "line_start": 1420,
+    "line_end": 1490,
+    "doc": "Transmit with DMA.",
+    "chunk_id": "c1",
+    "collection": "stm32",
+    "match": "prefix",
+    "matched_term": "SPI1",
 }
 
 
+def _default_handler(request: httpx.Request) -> httpx.Response:
+    """Serve the individual PageVault endpoints.
+
+    The questions the Datasheet Agent builds name SPI1 (and the MCU part
+    number); only SPI1 resolves to a symbol, and no chunks or pages come
+    back, which keeps the citation assertions exact.
+    """
+    if request.method == "POST" and request.url.path == "/text/search":
+        return httpx.Response(
+            200,
+            json={
+                "query": json.loads(request.content)["query"],
+                "collection": "stm32",
+                "mode": "hybrid",
+                "results": [],
+            },
+        )
+    if request.method == "GET" and request.url.path == "/text/symbols":
+        q = request.url.params.get("q", "")
+        if q == "SPI1":
+            return httpx.Response(
+                200, json={"query": q, "match": "prefix", "results": [SYMBOL]}
+            )
+        return httpx.Response(200, json={"query": q, "match": "none", "results": []})
+    if request.method == "POST" and request.url.path == "/search":
+        return httpx.Response(
+            200,
+            json={
+                "query": json.loads(request.content)["query"],
+                "collection": "stm32-manuals",
+                "results": [],
+            },
+        )
+    return httpx.Response(404, text="unknown route")
+
+
 def _rag_client(handler=None) -> PageVaultClient:
-    handler = handler or (lambda request: httpx.Response(200, json=UNIFIED_RESPONSE))
+    handler = handler or _default_handler
     return PageVaultClient(
         base_url="http://pagevault-api:8000",
         timeout=1.0,

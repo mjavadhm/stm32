@@ -1,7 +1,8 @@
 """Tests for the Chat Agent (agentic RAG).
 
 Every test runs fully offline: the knowledge base is an in-process
-httpx MockTransport and the LLM is a fake with scripted replies.
+httpx MockTransport (serving the individual PageVault endpoints) and the
+LLM is a fake with scripted replies.
 """
 
 import asyncio
@@ -13,43 +14,37 @@ import pytest
 import app.agents.qa as qa
 from app.rag.client import PageVaultClient
 
-UNIFIED_RESPONSE = {
-    "query": "spi dma",
-    "strategy": "quota",
-    "symbols": [
-        {
-            "name": "HAL_SPI_Transmit_DMA",
-            "kind": "function",
-            "signature": (
-                "HAL_StatusTypeDef HAL_SPI_Transmit_DMA"
-                "(SPI_HandleTypeDef *hspi, uint8_t *pData, uint16_t Size)"
-            ),
-            "path": "Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_spi.c",
-            "line_start": 1420,
-            "line_end": 1490,
-            "doc": "Transmit an amount of data in non-blocking mode with DMA.",
-            "match": "exact",
-            "matched_term": "HAL_SPI_Transmit",
-        }
-    ],
-    "type_context": [],
-    "chunks": [
-        {
-            "chunk_id": "c3",
-            "document_id": "d1",
-            "score": 0.82,
-            "name": "SPI with DMA",
-            "path": "RM0090.md",
-            "line_start": 10,
-            "line_end": 60,
-            "text": "Set the TXDMAEN bit in SPI_CR2 to enable DMA transmission.",
-            "metadata": {"family": "STM32F4"},
-        }
-    ],
-    "pages": [],
-    "identifiers": ["HAL_SPI_Transmit"],
-    "fused": [],
-    "warnings": [],
+CHUNK = {
+    "chunk_id": "c3",
+    "document_id": "d1",
+    "score": 0.82,
+    "kind": "section",
+    "name": "SPI with DMA",
+    "path": "RM0090.md",
+    "line_start": 10,
+    "line_end": 60,
+    "signature": "",
+    "heading_path": "SPI > DMA",
+    "text": "Set the TXDMAEN bit in SPI_CR2 to enable DMA transmission.",
+    "expanded_from_parent": False,
+    "metadata": {"family": "STM32F4"},
+}
+
+SYMBOL = {
+    "name": "HAL_SPI_Transmit_DMA",
+    "kind": "function",
+    "signature": (
+        "HAL_StatusTypeDef HAL_SPI_Transmit_DMA"
+        "(SPI_HandleTypeDef *hspi, uint8_t *pData, uint16_t Size)"
+    ),
+    "path": "Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_spi.c",
+    "line_start": 1420,
+    "line_end": 1490,
+    "doc": "Transmit an amount of data in non-blocking mode with DMA.",
+    "chunk_id": "c1",
+    "collection": "stm32",
+    "match": "prefix",
+    "matched_term": "HAL_SPI_Transmit",
 }
 
 
@@ -62,10 +57,54 @@ def _rag(handler) -> PageVaultClient:
 
 
 def _ok_handler(captured: list[dict] | None = None):
+    """Serve every channel: one chunk, one symbol, no types, no pages.
+
+    Only the identifier HAL_SPI_Transmit resolves; every other term (the
+    STM32F407 part number, the types referenced by the signature) matches
+    nothing, which keeps the channel counts in the assertions stable.
+    """
+
     def handler(request: httpx.Request) -> httpx.Response:
         if captured is not None:
-            captured.append(json.loads(request.content))
-        return httpx.Response(200, json=UNIFIED_RESPONSE)
+            captured.append(
+                {
+                    "method": request.method,
+                    "path": request.url.path,
+                    "params": dict(request.url.params),
+                    "body": json.loads(request.content) if request.content else None,
+                }
+            )
+        if request.method == "POST" and request.url.path == "/text/search":
+            return httpx.Response(
+                200,
+                json={
+                    "query": json.loads(request.content)["query"],
+                    "collection": "stm32",
+                    "mode": "hybrid",
+                    "results": [CHUNK],
+                },
+            )
+        if request.method == "GET" and request.url.path == "/text/symbols":
+            q = request.url.params.get("q", "")
+            if q == "HAL_SPI_Transmit_DMA":
+                return httpx.Response(
+                    200, json={"query": q, "match": "exact", "results": [SYMBOL]}
+                )
+            if q == "HAL_SPI_Transmit":
+                return httpx.Response(
+                    200, json={"query": q, "match": "prefix", "results": [SYMBOL]}
+                )
+            return httpx.Response(200, json={"query": q, "match": "none", "results": []})
+        if request.method == "POST" and request.url.path == "/search":
+            return httpx.Response(
+                200,
+                json={
+                    "query": json.loads(request.content)["query"],
+                    "collection": "stm32-manuals",
+                    "results": [],
+                },
+            )
+        return httpx.Response(404, text="unknown route")
 
     return handler
 
@@ -140,8 +179,10 @@ def test_a_planned_search_then_ready_streams_a_cited_answer(monkeypatch):
     assert done["failed"] is False
     json.dumps(done)  # must stay JSON-serialisable for the API layer
 
-    # Family detected from the question narrows retrieval.
-    assert captured[0]["text_filters"] == {"family": "STM32F4"}
+    # Family detected from the question narrows retrieval (case-insensitive).
+    text_requests = [r for r in captured if r["path"] == "/text/search"]
+    assert len(text_requests) == 1
+    assert text_requests[0]["body"]["filters"]["family"] == ["STM32F4", "stm32f4"]
 
     # The planner saw what its search returned before deciding again.
     assert len(llm.chat_calls) == 2
@@ -257,9 +298,41 @@ def test_follow_up_history_resolves_the_family(monkeypatch):
     ]
     _run(qa.answer_with_search("What about its prescaler?", history=history))
 
-    assert captured[0]["text_filters"] == {"family": "STM32F4"}
+    text_requests = [r for r in captured if r["path"] == "/text/search"]
+    assert text_requests[0]["body"]["filters"]["family"] == ["STM32F4", "stm32f4"]
     # History reached the answer phase.
     assert any("prescaler" in m["content"] for m in llm.stream_calls[0])
+
+
+def test_scope_narrows_every_search_the_agent_runs(monkeypatch):
+    captured: list[dict] = []
+    llm = FakeLLM(
+        replies=[
+            '{"action": "search", "query": "HAL_SPI_Transmit_DMA"}',
+            '{"action": "ready"}',
+        ],
+        chunks=["answer [RM0090.md:10-60]"],
+    )
+    _install(monkeypatch, llm, _rag(_ok_handler(captured)))
+
+    events = _run(
+        qa.answer_with_search(
+            QUESTION,
+            text_collection="code",
+            document_ids=["d1"],
+        )
+    )
+    done = events[-1]
+
+    text_requests = [r for r in captured if r["path"] == "/text/search"]
+    assert text_requests[0]["body"]["collection"] == "code"
+    assert text_requests[0]["body"]["filters"]["document_id"] == ["d1"]
+    # The scope is echoed back so the UI can show what was searched.
+    assert done["scope"] == {
+        "text_collection": "code",
+        "page_collection": None,
+        "document_ids": ["d1"],
+    }
 
 
 def test_history_is_trimmed_and_normalised(monkeypatch):

@@ -10,8 +10,16 @@ Design rules:
   * Retrieval failure is never fatal. A knowledge base that is down degrades
     an agent to "answers without citations", it does not fail the pipeline.
   * Every snippet keeps `path` and line numbers so answers can cite sources.
+
+Retrieval is a fan-out over PageVault's three individual endpoints -- text
+search, symbol lookup, visual page search -- orchestrated here, client-side.
+There is deliberately no unified endpoint and no cross-channel re-ranking:
+ColBERT MaxSim scores and cosine scores are not on the same scale, so a
+merged ranking would be quietly wrong. Each channel keeps its own slot and
+its own score, exactly as the agents consume them.
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -20,6 +28,7 @@ from typing import Any
 import httpx
 
 from app.core.config import settings
+from app.rag.query_terms import extract_identifiers, referenced_types
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +145,12 @@ def _snippet_from_chunk(raw: dict[str, Any], channel: str = "chunk") -> Snippet:
     )
 
 
-def _snippet_from_symbol(raw: dict[str, Any], channel: str = "symbol") -> Snippet:
+def _snippet_from_symbol(
+    raw: dict[str, Any],
+    channel: str = "symbol",
+    match: str = "",
+    matched_term: str = "",
+) -> Snippet:
     return Snippet(
         channel=channel,
         name=raw.get("name", ""),
@@ -147,8 +161,8 @@ def _snippet_from_symbol(raw: dict[str, Any], channel: str = "symbol") -> Snippe
         signature=raw.get("signature", ""),
         metadata={
             "kind": raw.get("kind", ""),
-            "match": raw.get("match", ""),
-            "matched_term": raw.get("matched_term", ""),
+            "match": match or raw.get("match", ""),
+            "matched_term": matched_term,
         },
     )
 
@@ -201,73 +215,398 @@ class PageVaultClient:
         symbol_top_k: int | None = None,
         page_top_k: int | None = None,
         text_filters: dict[str, Any] | None = None,
+        text_collection: str | None = None,
+        page_collection: str | None = None,
+        document_ids: list[str] | None = None,
     ) -> RagContext:
-        """Query every channel at once.
+        """Query every channel, one endpoint at a time.
 
         `family` (STM32F4, STM32F1 ...) is expressed as an ordinary metadata
-        filter rather than a PageVault feature, so the knowledge base stays
-        domain-agnostic and reusable outside this project.
+        filter on the text channel rather than a PageVault feature, so the
+        knowledge base stays domain-agnostic and reusable outside this
+        project.
+
+        `text_collection` / `page_collection` override the configured
+        defaults for this call -- the chat UI lets the user pick which part
+        of the knowledge base to ask against. `document_ids` narrows both
+        channels to specific ingested documents ("ask only this file").
+
+        Channels are independent: one failing channel becomes a warning and
+        the rest still answer. Only when every enabled channel fails is the
+        knowledge base reported as unavailable.
         """
         if not settings.rag_enabled:
             return RagContext(query=query, available=False, warnings=["RAG disabled"])
 
+        collection = text_collection or settings.rag_text_collection
+        page_col = page_collection or settings.rag_page_collection
+
         filters = dict(text_filters or {})
         if family:
-            filters["family"] = family
+            # The chunk payload carries the family as plain metadata, and
+            # this KB ingested it lowercase while our detection produces
+            # uppercase. A MatchAny of case variants matches either shape
+            # without the KB having to agree on a convention.
+            variants: list[str] = []
+            for variant in (family, family.lower(), family.upper()):
+                if variant not in variants:
+                    variants.append(variant)
+            filters["family"] = variants
+        if document_ids:
+            # Qdrant MatchAny on the payload key both channels index.
+            filters["document_id"] = list(document_ids)
+        page_filters: dict[str, Any] = (
+            {"document_id": list(document_ids)} if document_ids else {}
+        )
 
-        payload: dict[str, Any] = {
-            "query": query,
-            "text_collection": settings.rag_text_collection,
-            "text_top_k": text_top_k if text_top_k is not None else settings.rag_text_top_k,
-            "symbol_top_k": (
-                symbol_top_k if symbol_top_k is not None else settings.rag_symbol_top_k
-            ),
-            "page_collection": settings.rag_page_collection,
-            "page_top_k": page_top_k if page_top_k is not None else settings.rag_page_top_k,
-            "expand_types": True,
-            "strategy": "quota",
-        }
-        if filters:
-            payload["text_filters"] = filters
+        warnings: list[str] = []
+        # (name, enabled, warning, failed) per channel. `failed` only counts
+        # when the channel actually ran and its call(s) did not answer; a
+        # channel disabled by top_k=0 is neither a success nor a failure.
+        outcomes: list[tuple[str, bool, str | None, bool]] = []
+        text_on, page_on, symbol_on = self._channel_flags(
+            text_top_k, page_top_k, symbol_top_k
+        )
 
-        try:
-            response = await self._client.post("/text/unified-search", json=payload)
-            response.raise_for_status()
-            data = response.json()
-        except httpx.TimeoutException:
-            logger.warning("PageVault timed out after %ss", self.timeout)
-            return RagContext(
-                query=query,
-                available=False,
-                warnings=[f"knowledge base timed out after {self.timeout}s"],
+        # Chunks and pages both cost an embedding round trip on the
+        # PageVault side, so they run concurrently; the symbol channel is a
+        # fast indexed lookup and runs after, because type expansion needs
+        # its results.
+        (chunks, chunk_warning, chunk_failed), (pages, page_warning, page_failed) = (
+            await asyncio.gather(
+                self._search_chunks(query, filters, text_top_k, collection),
+                self._search_pages(query, page_top_k, page_col, page_filters),
             )
-        except Exception as exc:  # network error, 5xx, malformed JSON
-            logger.warning("PageVault query failed: %s", exc)
+        )
+        outcomes.append(("text", text_on, chunk_warning, chunk_failed))
+        outcomes.append(("visual", page_on, page_warning, page_failed))
+
+        identifiers = extract_identifiers(query)
+        symbols, symbol_warning, symbol_failed = await self._lookup_symbols(
+            identifiers, symbol_top_k, collection
+        )
+        # The symbol channel "runs" only when the question actually names an
+        # identifier; a skip makes zero HTTP calls and must not count as the
+        # knowledge base having answered.
+        symbol_attempted = symbol_on and bool(identifiers)
+        outcomes.append(("symbol", symbol_attempted, symbol_warning, symbol_failed))
+
+        type_context, type_warning, _type_failed = await self._expand_types(
+            symbols, chunks, collection
+        )
+        # Dependent channel: a failure here is a warning, never a verdict on
+        # the knowledge base itself.
+
+        for _name, _on, warning, _failed in outcomes:
+            if warning:
+                warnings.append(warning)
+        if type_warning:
+            warnings.append(type_warning)
+
+        attempted = [name for name, on, _w, _f in outcomes if on]
+        succeeded = [name for name, on, _w, failed in outcomes if on and not failed]
+        available = bool(succeeded) or not attempted
+        if not available:
+            logger.warning("every PageVault channel failed: %s", warnings)
             return RagContext(
                 query=query,
                 available=False,
-                warnings=[f"knowledge base unavailable: {exc}"],
+                warnings=warnings or ["knowledge base unavailable"],
             )
 
         return RagContext(
             query=query,
-            chunks=_above_score(
-                [_snippet_from_chunk(item) for item in data.get("chunks", [])],
-                settings.rag_min_score,
-            ),
-            symbols=[_snippet_from_symbol(item) for item in data.get("symbols", [])],
-            type_context=[
-                _snippet_from_symbol(item, channel="type")
-                for item in data.get("type_context", [])
-            ],
-            pages=_above_score(
-                [_snippet_from_page(item) for item in data.get("pages", [])],
-                settings.rag_min_score,
-            ),
-            identifiers=list(data.get("identifiers", [])),
-            warnings=list(data.get("warnings", [])),
+            chunks=chunks,
+            symbols=symbols,
+            type_context=type_context,
+            pages=pages,
+            identifiers=identifiers,
+            warnings=warnings,
             available=True,
         )
+
+    @staticmethod
+    def _channel_flags(
+        text_top_k: int | None, page_top_k: int | None, symbol_top_k: int | None
+    ) -> tuple[bool, bool, bool]:
+        """Which channels will actually run, in outcome order."""
+        return (
+            (text_top_k if text_top_k is not None else settings.rag_text_top_k) > 0,
+            (page_top_k if page_top_k is not None else settings.rag_page_top_k) > 0,
+            (symbol_top_k if symbol_top_k is not None else settings.rag_symbol_top_k) > 0,
+        )
+
+    def _channel_error(self, channel: str, exc: Exception) -> str:
+        """A warning a human can act on, with the timeout called out."""
+        if isinstance(exc, httpx.TimeoutException):
+            return f"{channel} channel timed out after {self.timeout}s"
+        return f"{channel} channel failed: {type(exc).__name__}: {exc}"
+
+    async def _search_chunks(
+        self,
+        query: str,
+        filters: dict[str, Any],
+        top_k: int | None,
+        collection: str | None = None,
+    ) -> tuple[list[Snippet], str | None, bool]:
+        """Documentation and code excerpts: POST /text/search (hybrid)."""
+        limit = top_k if top_k is not None else settings.rag_text_top_k
+        if limit <= 0:
+            return [], None, False
+        try:
+            response = await self._client.post(
+                "/text/search",
+                json={
+                    "query": query,
+                    "collection": collection or settings.rag_text_collection,
+                    "top_k": limit,
+                    "filters": filters or None,
+                    "mode": "hybrid",
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:
+            logger.warning("text channel failed: %s", exc)
+            return [], self._channel_error("text", exc), True
+        return (
+            _above_score(
+                [_snippet_from_chunk(item) for item in data.get("results", [])],
+                settings.rag_min_score,
+            ),
+            None,
+            False,
+        )
+
+    async def _search_pages(
+        self,
+        query: str,
+        top_k: int | None,
+        collection: str | None = None,
+        filters: dict[str, Any] | None = None,
+    ) -> tuple[list[Snippet], str | None, bool]:
+        """Reference-manual pages (visual hits): POST /search."""
+        limit = top_k if top_k is not None else settings.rag_page_top_k
+        if limit <= 0:
+            return [], None, False
+        try:
+            response = await self._client.post(
+                "/search",
+                json={
+                    "query": query,
+                    "collection": collection or settings.rag_page_collection,
+                    "top_k": limit,
+                    "filters": filters or {},
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:
+            logger.warning("visual channel failed: %s", exc)
+            return [], self._channel_error("visual", exc), True
+        return (
+            _above_score(
+                [_snippet_from_page(item) for item in data.get("results", [])],
+                settings.rag_min_score,
+            ),
+            None,
+            False,
+        )
+
+    async def _lookup_symbols(
+        self,
+        identifiers: list[str],
+        top_k: int | None,
+        collection: str | None = None,
+    ) -> tuple[list[Snippet], str | None, bool]:
+        """Exact API definitions for the identifiers named in the question.
+
+        The budget is shared across identifiers rather than granted to each,
+        so a three-identifier question does not flood the prompt. Only the
+        exact and prefix tiers are accepted -- the substring tier is noise
+        when the caller never typed the term.
+        """
+        limit = top_k if top_k is not None else settings.rag_symbol_top_k
+        if limit <= 0:
+            return [], None, False
+        if not identifiers:
+            # Not a failure: the question simply names no identifier. An
+            # empty symbol slot is better than substring noise.
+            return [], "symbol channel skipped: no C-like identifier found in the query", False
+
+        out: list[Snippet] = []
+        seen: set[tuple[str, str]] = set()
+        for term in identifiers:
+            if len(out) >= limit:
+                break
+            try:
+                response = await self._client.get(
+                    "/text/symbols",
+                    params={
+                        "q": term,
+                        "collection": collection or settings.rag_text_collection,
+                        "limit": limit - len(out),
+                    },
+                )
+                response.raise_for_status()
+                data = response.json()
+            except Exception as exc:
+                logger.warning("symbol channel failed for %s: %s", term, exc)
+                return [], self._channel_error("symbol", exc), True
+            if data.get("match") not in ("exact", "prefix"):
+                continue
+            for raw in data.get("results", []):
+                identity = (raw.get("name", ""), raw.get("path", ""))
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                out.append(
+                    _snippet_from_symbol(raw, match=data["match"], matched_term=term)
+                )
+                if len(out) >= limit:
+                    break
+        return out, None, False
+
+    async def _expand_types(
+        self,
+        symbols: list[Snippet],
+        chunks: list[Snippet],
+        collection: str | None = None,
+    ) -> tuple[list[Snippet], str | None, bool]:
+        """Definitions of the types the matched signatures depend on.
+
+        A generator handed HAL_SPI_TransmitReceive_DMA but not
+        SPI_HandleTypeDef writes a call it cannot type-check. Those
+        definitions are already in the symbol table, so pulling them in
+        costs one indexed lookup per type and closes a real gap.
+        """
+        limit = settings.rag_type_top_k
+        if limit <= 0 or not (symbols or chunks):
+            return [], None, False
+
+        already = {symbol.name for symbol in symbols}
+        wanted: list[str] = []
+        for signature in [s.signature for s in symbols] + [
+            c.signature for c in chunks if c.signature
+        ]:
+            for type_name in referenced_types(signature):
+                if type_name not in already and type_name not in wanted:
+                    wanted.append(type_name)
+
+        out: list[Snippet] = []
+        for type_name in wanted:
+            if len(out) >= limit:
+                break
+            try:
+                response = await self._client.get(
+                    "/text/symbols",
+                    params={
+                        "q": type_name,
+                        "collection": collection or settings.rag_text_collection,
+                        "limit": 1,
+                    },
+                )
+                response.raise_for_status()
+                data = response.json()
+            except Exception as exc:
+                logger.warning("type expansion failed for %s: %s", type_name, exc)
+                return out, self._channel_error("type expansion", exc), True
+            # Only an exact hit is context; a prefix hit is a different type.
+            if data.get("match") != "exact":
+                continue
+            results = data.get("results", [])
+            if results:
+                out.append(_snippet_from_symbol(results[0], channel="type"))
+        return out, None, False
+
+    # ------------------------------------------------------------------
+    # Knowledge-base browsing: what can the user choose to ask against?
+    # These power the collection/document selectors in the chat UI.
+    # ------------------------------------------------------------------
+
+    async def list_text_collections(self) -> tuple[list[dict], str | None]:
+        """Collections of code/docs chunks: GET /text/collections."""
+        try:
+            response = await self._client.get("/text/collections")
+            response.raise_for_status()
+            rows = response.json()
+        except Exception as exc:
+            logger.warning("listing text collections failed: %s", exc)
+            return [], self._channel_error("collections", exc)
+        return [
+            {
+                "name": row.get("name", ""),
+                "document_count": row.get("document_count", 0),
+                "chunk_count": row.get("chunk_count", 0),
+                "symbol_count": row.get("symbol_count", 0),
+            }
+            for row in rows
+        ], None
+
+    async def list_visual_collections(self) -> tuple[list[dict], str | None]:
+        """Collections of indexed PDF pages: GET /collections."""
+        try:
+            response = await self._client.get("/collections")
+            response.raise_for_status()
+            rows = response.json()
+        except Exception as exc:
+            logger.warning("listing visual collections failed: %s", exc)
+            return [], self._channel_error("collections", exc)
+        return [
+            {
+                "name": row.get("name", ""),
+                "document_count": row.get("document_count", 0),
+            }
+            for row in rows
+        ], None
+
+    async def list_documents(
+        self, collection: str, *, visual: bool = False
+    ) -> tuple[list[dict], str | None]:
+        """Documents of one collection: the "parts" a user can narrow to.
+
+        Text documents come from GET /text/documents (path, chunk and
+        symbol counts); visual ones from GET /documents?type=pdf (filename,
+        page count). Only indexed documents are returned -- a failed or
+        pending ingest has nothing to ask against.
+        """
+        try:
+            if visual:
+                response = await self._client.get(
+                    "/documents",
+                    params={"collection": collection, "type": "pdf"},
+                )
+                response.raise_for_status()
+                rows = response.json()
+                return [
+                    {
+                        "id": row.get("id", ""),
+                        "path": row.get("filename", ""),
+                        "status": row.get("status", ""),
+                        "pages": row.get("page_count"),
+                    }
+                    for row in rows
+                    if row.get("status") == "indexed"
+                ], None
+            response = await self._client.get(
+                "/text/documents", params={"collection": collection, "limit": 500}
+            )
+            response.raise_for_status()
+            rows = response.json()
+            return [
+                {
+                    "id": row.get("id", ""),
+                    "path": row.get("path", ""),
+                    "status": row.get("status", ""),
+                    "chunks": row.get("chunk_count", 0),
+                    "symbols": row.get("symbol_count", 0),
+                }
+                for row in rows
+                if row.get("status") == "indexed"
+            ], None
+        except Exception as exc:
+            logger.warning("listing documents failed: %s", exc)
+            return [], self._channel_error("documents", exc)
 
 
 @lru_cache(maxsize=1)

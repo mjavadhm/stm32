@@ -10,6 +10,7 @@ survive an agent failure, not vanish with the connection.
 """
 
 import json
+import logging
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
@@ -23,6 +24,8 @@ from app.db.models import Conversation, Message, utcnow
 from app.db.session import engine, get_session
 
 router = APIRouter(prefix="/chat", tags=["chat"])
+
+logger = logging.getLogger(__name__)
 
 
 def _conversation_summary(conversation: Conversation) -> dict:
@@ -51,6 +54,11 @@ class ConversationCreate(BaseModel):
 class MessageCreate(BaseModel):
     content: str = Field(min_length=1)
     family: str | None = None
+    # Retrieval scope, from the chat UI's selectors: which collections to
+    # search and, optionally, which specific documents ("parts") only.
+    text_collection: str | None = None
+    page_collection: str | None = None
+    document_ids: list[str] | None = Field(default=None, max_length=20)
 
 
 @router.post("/conversations")
@@ -146,6 +154,11 @@ async def send_message(
 
     question = content
     family = payload.family
+    scope_kwargs = {
+        "text_collection": payload.text_collection,
+        "page_collection": payload.page_collection,
+        "document_ids": payload.document_ids,
+    }
 
     async def event_stream() -> AsyncIterator[str]:
         # The request's session may close before a long stream ends; use a
@@ -153,12 +166,13 @@ async def send_message(
         done_event: dict | None = None
         try:
             async for event in answer_with_search(
-                question, history=history, family=family
+                question, history=history, family=family, **scope_kwargs
             ):
                 if event["type"] == "done":
                     done_event = event
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         except Exception as exc:  # the agent never raises; belt and braces
+            logger.exception("chat turn failed unexpectedly")
             yield f'data: {json.dumps({"type": "error", "detail": str(exc)})}\n\n'
 
         if done_event is None:
@@ -182,6 +196,7 @@ async def send_message(
                             "grounded": done_event["grounded"],
                             "verified": done_event["verified"],
                             "searches": done_event["searches"],
+                            "scope": done_event.get("scope"),
                             "warnings": done_event["warnings"],
                             "failed": done_event["failed"],
                         },

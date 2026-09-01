@@ -65,6 +65,10 @@ class Settings(BaseSettings):
     rag_symbol_top_k: int = 5
     # Visual page hits cost GPU time on the PageVault side; keep small.
     rag_page_top_k: int = 2
+    # Type expansion: exact lookups of the types referenced by matched
+    # signatures (SPI_HandleTypeDef, HAL_StatusTypeDef ...). Each is one
+    # indexed query and closes a real gap for code generation.
+    rag_type_top_k: int = 4
     # Ceiling on the retrieved context injected into a prompt. Local models
     # have far smaller context windows than hosted ones.
     rag_context_max_chars: int = 12000

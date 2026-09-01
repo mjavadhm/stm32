@@ -11,12 +11,19 @@ type Conversation = {
   updated_at: string;
 };
 
+type RetrievalScope = {
+  text_collection: string | null;
+  page_collection: string | null;
+  document_ids: string[] | null;
+};
+
 type MessagePayload = {
   citations: string[];
   cited: string[];
   grounded: boolean;
   verified: boolean;
   searches: string[];
+  scope: RetrievalScope | null;
   warnings: string[];
   failed: boolean;
 };
@@ -27,6 +34,25 @@ type ChatMessage = {
   content: string;
   payload: MessagePayload | null;
 };
+
+type KbCollection = {
+  name: string;
+  document_count: number;
+  chunk_count?: number;
+  symbol_count?: number;
+};
+
+type KbDocument = {
+  id: string;
+  path: string;
+  status: string;
+  chunks?: number;
+  symbols?: number;
+  pages?: number;
+};
+
+// "" = the backend's configured default collection.
+const DEFAULT_COLLECTION = "";
 
 // Live state for the turn being streamed.
 type LiveTurn = {
@@ -45,6 +71,57 @@ export default function ChatPage() {
   const [busy, setBusy] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+
+  // --- retrieval scope (collection / document selectors) ---
+  const [textCollections, setTextCollections] = useState<KbCollection[]>([]);
+  const [visualCollections, setVisualCollections] = useState<KbCollection[]>([]);
+  const [scopeText, setScopeText] = useState(DEFAULT_COLLECTION);
+  const [scopePage, setScopePage] = useState(DEFAULT_COLLECTION);
+  const [documents, setDocuments] = useState<KbDocument[]>([]);
+  const [scopeDocument, setScopeDocument] = useState("");
+  const [docsLoading, setDocsLoading] = useState(false);
+
+  const refreshCollections = useCallback(async () => {
+    try {
+      const r = await fetch(`${API_URL}/rag/collections`);
+      if (r.ok) {
+        const data = await r.json();
+        setTextCollections(data.text ?? []);
+        setVisualCollections(data.visual ?? []);
+      }
+    } catch {
+      /* knowledge base unreachable; the agent degrades with a warning */
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshCollections();
+  }, [refreshCollections]);
+
+  // When the text collection changes, load its documents ("parts").
+  useEffect(() => {
+    setScopeDocument("");
+    setDocuments([]);
+    if (!scopeText) return;
+    let cancelled = false;
+    setDocsLoading(true);
+    fetch(
+      `${API_URL}/rag/documents?kind=text&collection=${encodeURIComponent(scopeText)}`
+    )
+      .then((r) => (r.ok ? r.json() : { documents: [] }))
+      .then((data) => {
+        if (!cancelled) setDocuments(data.documents ?? []);
+      })
+      .catch(() => {
+        /* an unlistable collection still works; the selector just stays empty */
+      })
+      .finally(() => {
+        if (!cancelled) setDocsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [scopeText]);
 
   const refreshConversations = useCallback(async () => {
     try {
@@ -118,13 +195,19 @@ export default function ChatPage() {
     ]);
     setLive({ searches: [], answer: "", citations: [], warnings: [] });
 
+    const scope: RetrievalScope = {
+      text_collection: scopeText || null,
+      page_collection: scopePage || null,
+      document_ids: scopeDocument ? [scopeDocument] : null,
+    };
+
     try {
       const r = await fetch(
         `${API_URL}/chat/conversations/${selectedId}/messages`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ content }),
+          body: JSON.stringify({ content, ...scope }),
         }
       );
       if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
@@ -243,6 +326,14 @@ export default function ChatPage() {
                 {messages.map((m) => (
                   <div key={m.id ?? `local-${m.content}`} className={`bubble bubble-${m.role}`}>
                     <div className="bubble-text">{m.content}</div>
+                    {m.payload?.scope?.text_collection && (
+                      <div className="muted small" dir="ltr">
+                        scope: {m.payload.scope.text_collection}
+                        {m.payload.scope.document_ids?.length
+                          ? " · filtered to selected document"
+                          : ""}
+                      </div>
+                    )}
                     {m.payload && m.payload.cited.length > 0 && (
                       <div className="chip-row">
                         {m.payload.cited.map((c) => (
@@ -280,6 +371,61 @@ export default function ChatPage() {
                   </div>
                 )}
                 <div ref={bottomRef} />
+              </div>
+
+              {/* محدودهٔ جستجو */}
+              <div className="scope-row">
+                <label className="field-label">
+                  مجموعهٔ متنی
+                  <select
+                    value={scopeText}
+                    onChange={(e) => setScopeText(e.target.value)}
+                    disabled={busy}
+                  >
+                    <option value={DEFAULT_COLLECTION}>پیش‌فرض</option>
+                    {textCollections.map((c) => (
+                      <option key={c.name} value={c.name}>
+                        {c.name} ({c.document_count} سند)
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="field-label">
+                  مجموعهٔ صفحات
+                  <select
+                    value={scopePage}
+                    onChange={(e) => setScopePage(e.target.value)}
+                    disabled={busy}
+                  >
+                    <option value={DEFAULT_COLLECTION}>پیش‌فرض</option>
+                    {visualCollections.map((c) => (
+                      <option key={c.name} value={c.name}>
+                        {c.name} ({c.document_count} سند)
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="field-label">
+                  مستند (بخش)
+                  <select
+                    value={scopeDocument}
+                    onChange={(e) => setScopeDocument(e.target.value)}
+                    disabled={busy || !scopeText || docsLoading}
+                  >
+                    <option value="">
+                      {docsLoading
+                        ? "در حال بارگذاری…"
+                        : scopeText
+                          ? "همهٔ مستندها"
+                          : "اول مجموعهٔ متنی را انتخاب کن"}
+                    </option>
+                    {documents.map((d) => (
+                      <option key={d.id} value={d.id}>
+                        {d.path}
+                      </option>
+                    ))}
+                  </select>
+                </label>
               </div>
 
               <form onSubmit={sendMessage} className="chat-form">

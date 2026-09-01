@@ -17,7 +17,7 @@ from app.db.session import get_session, upgrade_database
 from app.main import app
 
 
-async def _fake_answer(question: str, *, history=None, family=None):
+async def _fake_answer(question: str, *, history=None, family=None, **kwargs):
     yield {"type": "search", "query": question, "index": 1, "max": 3}
     yield {
         "type": "search_result",
@@ -37,6 +37,11 @@ async def _fake_answer(question: str, *, history=None, family=None):
         "grounded": True,
         "verified": True,
         "searches": [question],
+        "scope": {
+            "text_collection": kwargs.get("text_collection"),
+            "page_collection": kwargs.get("page_collection"),
+            "document_ids": kwargs.get("document_ids"),
+        },
         "warnings": [],
         "failed": False,
     }
@@ -125,7 +130,7 @@ def test_history_reaches_the_agent(tmp_path: Path, monkeypatch):
 
     seen: dict[str, Any] = {}
 
-    async def fake_answer(question, *, history=None, family=None):
+    async def fake_answer(question, *, history=None, family=None, **kwargs):
         seen["question"] = question
         seen["history"] = history
         yield {
@@ -136,6 +141,11 @@ def test_history_reaches_the_agent(tmp_path: Path, monkeypatch):
             "grounded": False,
             "verified": False,
             "searches": [question],
+            "scope": {
+                "text_collection": kwargs.get("text_collection"),
+                "page_collection": kwargs.get("page_collection"),
+                "document_ids": kwargs.get("document_ids"),
+            },
             "warnings": [],
             "failed": False,
         }
@@ -153,6 +163,61 @@ def test_history_reaches_the_agent(tmp_path: Path, monkeypatch):
 
     assert seen["question"] == "second question"
     assert [m["content"] for m in seen["history"]] == ["first question", "ok"]
+
+
+def test_the_selected_scope_reaches_the_agent_and_is_persisted(
+    tmp_path: Path, monkeypatch
+):
+    client = _setup(tmp_path, monkeypatch)
+    conversation_id = client.post("/chat/conversations", json={}).json()["id"]
+
+    seen: dict[str, Any] = {}
+
+    async def fake_answer(question, *, history=None, family=None, **kwargs):
+        seen.update(kwargs)
+        yield {
+            "type": "done",
+            "answer": "ok",
+            "citations": [],
+            "cited": [],
+            "grounded": False,
+            "verified": False,
+            "searches": [question],
+            "scope": {
+                "text_collection": kwargs.get("text_collection"),
+                "page_collection": kwargs.get("page_collection"),
+                "document_ids": kwargs.get("document_ids"),
+            },
+            "warnings": [],
+            "failed": False,
+        }
+
+    monkeypatch.setattr(chat_module, "answer_with_search", fake_answer)
+
+    with client.stream(
+        "POST",
+        f"/chat/conversations/{conversation_id}/messages",
+        json={
+            "content": "spi dma?",
+            "text_collection": "code",
+            "page_collection": "default",
+            "document_ids": ["d1"],
+        },
+    ) as response:
+        assert response.status_code == 200
+        "".join(response.iter_text())
+
+    assert seen == {
+        "text_collection": "code",
+        "page_collection": "default",
+        "document_ids": ["d1"],
+    }
+    detail = client.get(f"/chat/conversations/{conversation_id}").json()
+    assert detail["messages"][1]["payload"]["scope"] == {
+        "text_collection": "code",
+        "page_collection": "default",
+        "document_ids": ["d1"],
+    }
 
 
 def test_messages_to_a_missing_conversation_404(tmp_path: Path, monkeypatch):

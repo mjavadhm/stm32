@@ -170,8 +170,15 @@ async def answer_with_search(
     *,
     history: list[dict[str, str]] | None = None,
     family: str | None = None,
+    text_collection: str | None = None,
+    page_collection: str | None = None,
+    document_ids: list[str] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Answer one chat turn, planning retrieval along the way.
+
+    The optional scope narrows where the agent may search: a text/page
+    collection, or specific documents within them (the chat UI's
+    collection and "part" selectors).
 
     Yields the event stream described in the module docstring. Never
     raises: every failure mode degrades to a done event with warnings.
@@ -185,6 +192,21 @@ async def answer_with_search(
             family = detect_family(item["content"])
             if family:
                 break
+
+    scope = {
+        "text_collection": text_collection,
+        "page_collection": page_collection,
+        "document_ids": document_ids,
+    }
+
+    async def _run_search(query: str) -> RagContext:
+        return await rag.search(
+            query,
+            family=family,
+            text_collection=text_collection,
+            page_collection=page_collection,
+            document_ids=document_ids,
+        )
 
     llm = get_agent_llm(AGENT_NAME)
     rag = get_rag_client()
@@ -209,6 +231,15 @@ async def answer_with_search(
             warnings.append(f"retrieval planning failed: {exc}")
             planning_failed = True
             break
+        except Exception as exc:
+            # Provider outage (auth, network, rate limit): planning is not
+            # the user's problem to read as a crash -- degrade like every
+            # other failure mode and let the answer phase try the no-context
+            # prompt.
+            logger.warning("chat planning call failed: %s", exc)
+            warnings.append(f"retrieval planning call failed: {exc}")
+            planning_failed = True
+            break
 
         if action.action != "search" or not action.query.strip():
             break
@@ -217,7 +248,7 @@ async def answer_with_search(
         searches.append(query)
         yield {"type": "search", "query": query, "index": len(searches), "max": max_searches}
 
-        context = await rag.search(query, family=family)
+        context = await _run_search(query)
         contexts.append(context)
         yield {
             "type": "search_result",
@@ -250,7 +281,7 @@ async def answer_with_search(
         query = question
         searches.append(query)
         yield {"type": "search", "query": query, "index": 1, "max": max_searches}
-        context = await rag.search(query, family=family)
+        context = await _run_search(query)
         contexts.append(context)
         yield {
             "type": "search_result",
@@ -272,7 +303,7 @@ async def answer_with_search(
         query = question
         searches.append(query)
         yield {"type": "search", "query": query, "index": 1, "max": max_searches}
-        context = await rag.search(query, family=family)
+        context = await _run_search(query)
         contexts.append(context)
         yield {
             "type": "search_result",
@@ -320,6 +351,7 @@ async def answer_with_search(
         "grounded": grounded,
         "verified": bool(cited),
         "searches": searches,
+        "scope": scope,
         "warnings": warnings,
         "failed": failed,
     }
