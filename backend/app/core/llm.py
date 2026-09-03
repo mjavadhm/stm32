@@ -12,6 +12,7 @@ Usage inside an agent:
 """
 
 import logging
+import re
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -163,15 +164,53 @@ class AgentLLM:
         )
         return resp.choices[0].message.content or ""
 
+    # Models that reason before answering (glm-5.x, o1/o3, DeepSeek-R ...).
+    # Matched against the model name so the check costs nothing per call.
+    _REASONING_RE = re.compile(
+        settings.llm_reasoning_model_pattern, re.IGNORECASE
+    )
+
+    async def plan(self, messages: list[dict], **kwargs) -> str:
+        """A `chat` call for pure JSON decision steps (query planning).
+
+        Reasoning models burn their latency *before* the first output
+        token, and a JSON action gains nothing from it: measured 63s with
+        full reasoning vs 20s at minimal effort for the same 3-token reply.
+        So on reasoning models, planning runs at minimal effort. Providers
+        that reject the parameter answer 400, which is caught and retried
+        once without it.
+        """
+        if self._REASONING_RE.search(self.model or ""):
+            kwargs.setdefault("reasoning_effort", settings.llm_planning_reasoning_effort)
+            try:
+                return await self.chat(messages, **kwargs)
+            except Exception as exc:
+                if "reasoning_effort" not in str(exc):
+                    raise
+                logger.warning(
+                    "%s: provider rejected reasoning_effort; retrying without it",
+                    self.agent_name,
+                )
+                kwargs.pop("reasoning_effort", None)
+        return await self.chat(messages, **kwargs)
+
     async def stream(self, messages: list[dict], **kwargs) -> AsyncIterator[str]:
         """Yield the reply token by token.
 
         Only the final answer of a chat turn is streamed; planning steps
         stay on chat() so a malformed JSON action never reaches the UI as
         half-rendered text.
+
+        Reasoning models (glm-4.7+, o1-style) spend completion tokens on
+        hidden reasoning before any visible content, so max_tokens must
+        never clip a stream: what looks like "10 tokens is plenty for a
+        short answer" silently produces an empty one. The setting only
+        applies to non-streaming calls, where an empty reply is at least
+        visible as a failure.
         """
-        if settings.llm_max_tokens and "max_tokens" not in kwargs:
-            kwargs["max_tokens"] = settings.llm_max_tokens
+        kwargs.pop("max_tokens", None)
+        if settings.llm_max_tokens and settings.llm_stream_max_tokens:
+            kwargs.setdefault("max_tokens", settings.llm_stream_max_tokens)
         stream = await self.client.chat.completions.create(
             model=self.model,
             messages=messages,

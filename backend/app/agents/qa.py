@@ -225,7 +225,7 @@ async def answer_with_search(
     while len(searches) < max_searches:
         try:
             action, _plan_warnings, _raw = await request_contract(
-                llm, _SearchAction, decision, temperature=0
+                llm, _SearchAction, decision, temperature=0, call="plan"
             )
         except ContractError as exc:
             warnings.append(f"retrieval planning failed: {exc}")
@@ -330,7 +330,8 @@ async def answer_with_search(
             yield {"type": "delta", "text": delta}
     except Exception as exc:
         logger.warning("chat answer streaming failed: %s", exc)
-        warnings.append(f"answer generation failed: {exc}")
+        detail = str(exc) or f"{type(exc).__module__}.{type(exc).__name__}"
+        warnings.append(f"answer generation failed: {detail}")
         failed = True
 
     citations: list[str] = []

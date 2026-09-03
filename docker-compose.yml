@@ -32,6 +32,15 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    networks:
+      default:
+        aliases:
+          # Unambiguous DNS name. On rag-net the bare name `redis` belongs to
+          # PageVault's redis, and any container on both networks (backend,
+          # worker) may resolve that one -- which silently pointed our Celery
+          # broker at the wrong server and made our worker steal PageVault's
+          # tasks (every other embed_query died with NotRegistered).
+          - stm32-redis
 
   qdrant:
     image: qdrant/qdrant:v1.12.4
@@ -40,6 +49,11 @@ services:
       - "6334:6334"
     volumes:
       - qdrant_data:/qdrant/storage
+    networks:
+      default:
+        aliases:
+          # Same reason as redis: `qdrant` on rag-net is PageVault's.
+          - stm32-qdrant
 
   backend:
     build: ./backend

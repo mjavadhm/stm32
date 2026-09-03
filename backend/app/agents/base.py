@@ -42,13 +42,19 @@ async def request_contract[TContract: BaseModel](
     *,
     temperature: float = 0.0,
     retries: int | None = None,
+    call: str = "chat",
     **chat_kwargs: Any,
 ) -> tuple[TContract, list[str], str]:
     """Ask for a contract, repairing a malformed reply before giving up.
 
+    `call` selects the LLM entrypoint: "chat" (default) or "plan" (minimal
+    reasoning effort for reasoning models -- a JSON action gains nothing
+    from full reasoning and pays its latency).
+
     Returns `(contract, warnings, raw_reply)`. Raises `ContractError` when
     every attempt fails, leaving the degrade-or-fail decision to the agent.
     """
+    chat = getattr(llm, call, None) or llm.chat
     attempts = 1 + (settings.llm_contract_retries if retries is None else retries)
     warnings: list[str] = []
     conversation = list(messages)
@@ -56,7 +62,7 @@ async def request_contract[TContract: BaseModel](
     last_error: ContractError | None = None
 
     for attempt in range(1, attempts + 1):
-        reply = await llm.chat(conversation, temperature=temperature, **chat_kwargs)
+        reply = await chat(conversation, temperature=temperature, **chat_kwargs)
         try:
             return parse_model(model, reply), warnings, reply
         except ContractError as exc:

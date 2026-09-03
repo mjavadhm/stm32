@@ -37,7 +37,21 @@ class Settings(BaseSettings):
 
     # Ceiling on generated tokens. 0 = leave it to the provider. Set it when
     # running locally: a runaway generation costs minutes, not cents.
+    # NOTE: applies to non-streaming calls only (see llm_stream_max_tokens).
     llm_max_tokens: int = 0
+    # Separate ceiling for streamed answers, or 0 to leave unbounded.
+    # Reasoning models burn hundreds of hidden reasoning tokens before the
+    # first visible one, so the plain ceiling must not clip a stream.
+    llm_stream_max_tokens: int = 0
+    # A model is considered a reasoning model when its name matches this
+    # (substring, case-insensitive). Planning calls are pure JSON decisions
+    # and reasoning adds nothing but latency there; streamed answers keep
+    # full reasoning. "none" disables the check entirely.
+    llm_reasoning_model_pattern: str = "glm|o1|o3|o4|deepseek-r|qwen3"
+    # Effort passed to reasoning models on planning calls: minimal | low |
+    # medium | high. Providers that do not support the parameter reject it,
+    # which is caught and retried without it.
+    llm_planning_reasoning_effort: str = "minimal"
     # A contract reply that fails validation is retried this many times, with
     # the parser error fed back to the model, before the agent degrades
     # (docs/architecture.md decision #3).
