@@ -559,15 +559,239 @@ code {
   gap: 0.6rem;
 }
 
-.prose {
+/* ---------------------------------------------------------------------------
+ * Markdown answers
+ *
+ * The model writes real markdown -- headings, tables, nested and task lists,
+ * block quotes, fenced code -- so every construct needs a style. Direction is
+ * inherited (RTL) for prose; code and tables are forced LTR by the renderer,
+ * because a Latin identifier inside an RTL paragraph gets reordered on screen.
+ * ------------------------------------------------------------------------- */
+
+.markdown {
   line-height: 1.85;
   font-size: 0.93rem;
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
-.prose:empty {
-  display: none;
+.markdown > *:first-child {
+  margin-top: 0;
+}
+
+.markdown > *:last-child {
+  margin-bottom: 0;
+}
+
+.markdown p {
+  margin: 0 0 0.7rem;
+}
+
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4,
+.markdown h5,
+.markdown h6 {
+  margin: 1.1rem 0 0.5rem;
+  line-height: 1.4;
+  font-weight: 650;
+  color: #eef1f6;
+}
+
+.markdown h1 { font-size: 1.2rem; }
+.markdown h2 { font-size: 1.1rem; }
+.markdown h3 { font-size: 1rem; }
+.markdown h4,
+.markdown h5,
+.markdown h6 { font-size: 0.94rem; }
+
+.markdown h1,
+.markdown h2 {
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid #222734;
+}
+
+.markdown ul,
+.markdown ol {
+  margin: 0 0 0.7rem;
+  padding-inline-start: 1.4rem;
+}
+
+.markdown li {
+  margin: 0.2rem 0;
+}
+
+.markdown li > p {
+  margin: 0;
+}
+
+/* GFM task lists: the checkbox is a state, not a control. */
+.markdown li:has(> input[type="checkbox"]) {
+  list-style: none;
+  margin-inline-start: -1.2rem;
+}
+
+.markdown input[type="checkbox"] {
+  width: auto;
+  margin-inline-end: 0.4rem;
+  accent-color: #4a6cf7;
+  pointer-events: none;
+}
+
+.markdown blockquote {
+  margin: 0 0 0.7rem;
+  padding: 0.1rem 0.9rem;
+  border-inline-start: 3px solid #33406b;
+  color: #b6bfcd;
+}
+
+.markdown hr {
+  border: none;
+  border-top: 1px solid #222734;
+  margin: 1rem 0;
+}
+
+.markdown a {
+  color: #9db1ff;
+}
+
+.markdown strong {
+  color: #eef1f6;
+  font-weight: 650;
+}
+
+/* Inline code. `pre code` is reset separately below. */
+.markdown code {
+  background: #0d1017;
+  border: 1px solid #1e2330;
+  border-radius: 5px;
+  padding: 0.08rem 0.3rem;
+  font-family: ui-monospace, "Fira Code", monospace;
+  font-size: 0.85em;
+}
+
+.markdown pre {
+  background: #0d1017;
+  border: 1px solid #222734;
+  border-radius: 8px;
+  padding: 0.7rem 0.85rem;
+  overflow-x: auto;
+  margin: 0 0 0.7rem;
+  text-align: left;
+}
+
+.markdown pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 0.82rem;
+  line-height: 1.6;
+}
+
+/* GFM tables. Wrapped in .table-scroll so a wide register table scrolls
+ * instead of stretching the bubble. */
+.table-scroll {
+  overflow-x: auto;
+  margin: 0 0 0.7rem;
+}
+
+.markdown table {
+  border-collapse: collapse;
+  font-size: 0.85rem;
+  min-width: 100%;
+}
+
+.markdown th,
+.markdown td {
+  border: 1px solid #222734;
+  padding: 0.35rem 0.6rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.markdown th {
+  background: #171b24;
+  color: #eef1f6;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.markdown tbody tr:nth-child(even) {
+  background: #14171f;
+}
+
+.answer-partial {
+  border-inline-start: 2px solid #e6c877;
+  padding-inline-start: 0.7rem;
+}
+
+/* --- syntax highlighting (rehype-highlight / highlight.js classes) --- */
+
+.markdown .hljs-comment,
+.markdown .hljs-quote {
+  color: #6b7488;
+  font-style: italic;
+}
+
+.markdown .hljs-keyword,
+.markdown .hljs-selector-tag,
+.markdown .hljs-literal,
+.markdown .hljs-section,
+.markdown .hljs-doctag,
+.markdown .hljs-type,
+.markdown .hljs-name,
+.markdown .hljs-strong {
+  color: #c792ea;
+}
+
+.markdown .hljs-string,
+.markdown .hljs-title,
+.markdown .hljs-attr,
+.markdown .hljs-attribute,
+.markdown .hljs-symbol,
+.markdown .hljs-bullet,
+.markdown .hljs-addition {
+  color: #a3e08b;
+}
+
+.markdown .hljs-number,
+.markdown .hljs-selector-attr,
+.markdown .hljs-selector-pseudo,
+.markdown .hljs-meta,
+.markdown .hljs-variable,
+.markdown .hljs-template-variable {
+  color: #f2b374;
+}
+
+.markdown .hljs-title.function_,
+.markdown .hljs-function .hljs-title,
+.markdown .hljs-built_in,
+.markdown .hljs-class .hljs-title {
+  color: #82b6ff;
+}
+
+.markdown .hljs-meta .hljs-keyword,
+.markdown .hljs-meta-string {
+  color: #7fd6a9;
+}
+
+.markdown .hljs-deletion {
+  color: #ef7d7d;
+}
+
+.markdown .hljs-emphasis {
+  font-style: italic;
+}
+
+/* --- reasoning trace (shown while a reasoning model thinks) --- */
+
+.reasoning-text {
+  color: #8b94a6;
+  font-style: italic;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 8rem;
+  overflow-y: auto;
 }
 
 .code-block {
@@ -766,4 +990,13 @@ code {
   gap: 0.4rem;
   padding: 0.9rem 1rem;
   border-bottom: 1px solid #1a1e28;
+}
+
+/* A visual citation resolves to the page image the model was shown. */
+.source-page {
+  width: 100%;
+  height: auto;
+  border: 1px solid #222734;
+  border-radius: 6px;
+  background: #fff;
 }

@@ -459,6 +459,81 @@ def test_health_is_false_when_pagevault_is_down():
     assert asyncio.run(_client(boom).health()) is False
 
 
+def test_a_symbol_skip_is_a_note_not_a_user_visible_warning():
+    """A question naming no identifier is normal, not something wrong.
+
+    The skip used to travel in the warning slot, so every natural-language
+    question (and every Persian one) showed retrieval plumbing to the user.
+    """
+    captured: list[dict] = []
+    context = asyncio.run(
+        _client(_ok_handler(captured)).search("How do I configure a timer?")
+    )
+
+    assert context.available is True
+    assert context.identifiers == []
+    assert context.warnings == []
+    assert any("symbol channel skipped" in note for note in context.notes)
+    # And it really did skip: no symbol lookup was attempted.
+    assert not [r for r in captured if r["path"] == "/text/symbols"]
+
+
+def test_partial_symbol_results_survive_a_later_failure():
+    """A term that fails must not discard what earlier terms found."""
+
+    def flaky_symbols(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/text/symbols":
+            if request.url.params.get("q") == "HAL_SPI_Transmit":
+                return httpx.Response(
+                    200, json={"match": "prefix", "results": [SYMBOL]}
+                )
+            raise httpx.ConnectError("symbols down", request=request)
+        return _ok_handler()(request)
+
+    context = asyncio.run(_client(flaky_symbols).search(QUESTION))
+
+    assert context.available is True
+    assert [s.name for s in context.symbols] == ["HAL_SPI_Transmit_DMA"]
+    assert any("symbol" in warning for warning in context.warnings)
+
+
+def test_repeated_channel_warnings_are_deduped():
+    """One dead channel is one warning, however many calls hit it."""
+
+    def dead_symbols(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/text/symbols":
+            raise httpx.ConnectError("symbols down", request=request)
+        return _ok_handler()(request)
+
+    context = asyncio.run(_client(dead_symbols).search(QUESTION))
+
+    assert len(context.warnings) == len(set(context.warnings))
+
+
+def test_a_page_hit_carries_what_the_ui_needs_to_resolve_it():
+    """A visual citation must be resolvable back to a page image."""
+    page = {
+        "document_id": "07c66e7d-879c-4fb3-a7a4-9a8df381c613",
+        "page_number": 213,
+        "score": 0.61,
+        "image_url": "http://pagevault-api:8000/files/07c66e7d/pages/213.png",
+        "filename": "rm0090.pdf",
+    }
+
+    def with_pages(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/search":
+            return httpx.Response(200, json={"results": [page]})
+        return _ok_handler()(request)
+
+    context = asyncio.run(_client(with_pages).search(QUESTION))
+
+    (hit,) = context.pages
+    assert hit.citation == "07c66e7d-879c-4fb3-a7a4-9a8df381c613#p213"
+    assert hit.metadata["document_id"] == "07c66e7d-879c-4fb3-a7a4-9a8df381c613"
+    assert hit.metadata["page_number"] == 213
+    assert hit.metadata["filename"] == "rm0090.pdf"
+
+
 # --- datasheet agent -------------------------------------------------------
 
 
@@ -531,3 +606,40 @@ def test_agent_still_answers_when_the_knowledge_base_is_down(monkeypatch):
     assert result["grounded"] is False
     assert result["citations"] == []
     assert result["warnings"]
+
+
+# --- /rag/source: both citation shapes -------------------------------------
+
+
+def test_a_page_citation_resolves_to_a_proxied_image(monkeypatch):
+    """`<document_id>#pN` used to 404: it was parsed as a file path.
+
+    A visual hit has no text to return, so the answer is a pointer to the
+    page image, proxied through this API (the browser cannot reach PageVault).
+    """
+    from app.api.routes import rag as rag_routes
+
+    result = asyncio.run(
+        rag_routes.rag_source(
+            citation="07c66e7d-879c-4fb3-a7a4-9a8df381c613#p213", collection=None
+        )
+    )
+
+    assert result["kind"] == "page"
+    assert result["document_id"] == "07c66e7d-879c-4fb3-a7a4-9a8df381c613"
+    assert result["page"] == 213
+    assert result["chunks"] == []
+    assert result["image_url"] == (
+        "/rag/page?document_id=07c66e7d-879c-4fb3-a7a4-9a8df381c613&page=213"
+    )
+
+
+def test_the_page_proxy_rejects_a_traversing_document_id():
+    """The id is interpolated into a PageVault URL path."""
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    client = TestClient(app)
+    response = client.get("/rag/page", params={"document_id": "../../health", "page": 1})
+    assert response.status_code == 422

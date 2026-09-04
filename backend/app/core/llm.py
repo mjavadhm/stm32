@@ -146,6 +146,26 @@ def is_agent_enabled(agent_name: str) -> bool:
     return enabled
 
 
+@lru_cache(maxsize=4)
+def _compile_reasoning_pattern(pattern: str) -> re.Pattern[str]:
+    """Compile the reasoning-model pattern, treating junk as "match nothing".
+
+    An empty or invalid pattern must not silently mean "every model is a
+    reasoning model" -- an empty regex matches everything.
+    """
+    if not pattern or pattern.strip().lower() in ("none", "off", "-"):
+        return re.compile(r"(?!)")  # never matches
+    try:
+        return re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        logger.warning("invalid llm_reasoning_model_pattern %r; ignoring", pattern)
+        return re.compile(r"(?!)")
+
+
+def _reasoning_pattern() -> re.Pattern[str]:
+    return _compile_reasoning_pattern(settings.llm_reasoning_model_pattern)
+
+
 @dataclass(frozen=True)
 class AgentLLM:
     """LLM handle for one agent: shared provider client + that agent's model."""
@@ -164,11 +184,14 @@ class AgentLLM:
         )
         return resp.choices[0].message.content or ""
 
-    # Models that reason before answering (glm-5.x, o1/o3, DeepSeek-R ...).
-    # Matched against the model name so the check costs nothing per call.
-    _REASONING_RE = re.compile(
-        settings.llm_reasoning_model_pattern, re.IGNORECASE
-    )
+    def _is_reasoning_model(self) -> bool:
+        """Does this agent's model reason before answering?
+
+        Matched on the model name, so the check costs nothing per call. The
+        pattern is read through a cache rather than compiled at import, so a
+        changed setting (or a test that patches it) takes effect.
+        """
+        return bool(_reasoning_pattern().search(self.model or ""))
 
     async def plan(self, messages: list[dict], **kwargs) -> str:
         """A `chat` call for pure JSON decision steps (query planning).
@@ -180,7 +203,7 @@ class AgentLLM:
         that reject the parameter answer 400, which is caught and retried
         once without it.
         """
-        if self._REASONING_RE.search(self.model or ""):
+        if self._is_reasoning_model():
             kwargs.setdefault("reasoning_effort", settings.llm_planning_reasoning_effort)
             try:
                 return await self.chat(messages, **kwargs)
@@ -195,22 +218,34 @@ class AgentLLM:
         return await self.chat(messages, **kwargs)
 
     async def stream(self, messages: list[dict], **kwargs) -> AsyncIterator[str]:
-        """Yield the reply token by token.
+        """Yield the visible reply token by token."""
+        async for kind, text in self.stream_events(messages, **kwargs):
+            if kind == "content":
+                yield text
+
+    async def stream_events(
+        self, messages: list[dict], **kwargs
+    ) -> AsyncIterator[tuple[str, str]]:
+        """Yield `(kind, text)` where kind is "content" or "reasoning".
 
         Only the final answer of a chat turn is streamed; planning steps
         stay on chat() so a malformed JSON action never reaches the UI as
         half-rendered text.
 
-        Reasoning models (glm-4.7+, o1-style) spend completion tokens on
-        hidden reasoning before any visible content, so max_tokens must
-        never clip a stream: what looks like "10 tokens is plenty for a
-        short answer" silently produces an empty one. The setting only
-        applies to non-streaming calls, where an empty reply is at least
-        visible as a failure.
+        Reasoning models spend completion tokens on hidden reasoning before
+        any visible content. Two consequences are handled here:
+
+        * `max_tokens` must never clip a stream -- what looks like "10
+          tokens is plenty for a short answer" silently produces an empty
+          one. `llm_max_tokens` is therefore ignored for streams and only
+          the explicit `llm_stream_max_tokens` applies.
+        * providers that expose the reasoning trace (`reasoning_content`)
+          have it forwarded separately, so the UI can show progress instead
+          of a frozen bubble, without it ever contaminating the answer.
         """
         kwargs.pop("max_tokens", None)
-        if settings.llm_max_tokens and settings.llm_stream_max_tokens:
-            kwargs.setdefault("max_tokens", settings.llm_stream_max_tokens)
+        if settings.llm_stream_max_tokens:
+            kwargs["max_tokens"] = settings.llm_stream_max_tokens
         stream = await self.client.chat.completions.create(
             model=self.model,
             messages=messages,
@@ -220,9 +255,14 @@ class AgentLLM:
         async for chunk in stream:
             if not chunk.choices:
                 continue
-            delta = chunk.choices[0].delta.content
-            if delta:
-                yield delta
+            delta = chunk.choices[0].delta
+            reasoning = getattr(delta, "reasoning_content", None) or getattr(
+                delta, "reasoning", None
+            )
+            if reasoning:
+                yield "reasoning", reasoning
+            if delta.content:
+                yield "content", delta.content
 
 
 def get_agent_llm(agent_name: str) -> AgentLLM:

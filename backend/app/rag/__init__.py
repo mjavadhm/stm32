@@ -17,6 +17,7 @@ from app.rag.client import (
     RagContext,
     Snippet,
     close_rag_client,
+    dedupe,
     get_rag_client,
 )
 
@@ -25,5 +26,6 @@ __all__ = [
     "RagContext",
     "Snippet",
     "close_rag_client",
+    "dedupe",
     "get_rag_client",
 ]

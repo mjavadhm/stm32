@@ -2,6 +2,8 @@
 
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 
+import { AnswerBody, citationLabel } from "./answer";
+
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 type Conversation = {
@@ -26,6 +28,8 @@ type MessagePayload = {
   scope: RetrievalScope | null;
   warnings: string[];
   failed: boolean;
+  /** The stream was cut short; the text is whatever arrived. */
+  partial?: boolean;
 };
 
 type ChatMessage = {
@@ -60,103 +64,33 @@ type SourceChunk = {
 
 type SourceView = {
   citation: string;
+  /** "text" for a code/doc chunk, "page" for a reference-manual image. */
+  kind?: "text" | "page";
   path: string;
   lines: [number, number] | null;
   chunks: SourceChunk[];
+  page?: number;
+  image_url?: string;
 };
 
 type LiveTurn = {
   searches: string[];
   answer: string;
+  reasoning: string;
   citations: string[];
   warnings: string[];
 };
 
+const EMPTY_TURN: LiveTurn = {
+  searches: [],
+  answer: "",
+  reasoning: "",
+  citations: [],
+  warnings: [],
+};
+
 // "" = the backend's configured default collection.
 const DEFAULT_COLLECTION = "";
-
-/** A citation is `path:start-end`; show the file name, keep the rest as title. */
-function citationLabel(citation: string): string {
-  const [path, lines] = splitCitation(citation);
-  const file = path.split("/").pop() || path;
-  return lines ? `${file}:${lines}` : file;
-}
-
-function splitCitation(citation: string): [string, string | null] {
-  const at = citation.lastIndexOf(":");
-  if (at === -1) return [citation, null];
-  const lines = citation.slice(at + 1);
-  return /^\d+-\d+$/.test(lines)
-    ? [citation.slice(0, at), lines]
-    : [citation, null];
-}
-
-/** Render answer text: fenced code blocks as <pre>, [citations] clickable. */
-function AnswerBody({
-  text,
-  onCitation,
-}: {
-  text: string;
-  onCitation: (citation: string) => void;
-}) {
-  const blocks = text.split(/```/);
-  return (
-    <div className="answer">
-      {blocks.map((block, index) =>
-        index % 2 === 1 ? (
-          <pre key={index} dir="ltr" className="code-block">
-            <code>{block.replace(/^[a-zA-Z]*\n/, "")}</code>
-          </pre>
-        ) : (
-          <Prose key={index} text={block} onCitation={onCitation} />
-        )
-      )}
-    </div>
-  );
-}
-
-/** Prose with `[path:1-2]` turned into buttons and `**bold**` honoured. */
-function Prose({
-  text,
-  onCitation,
-}: {
-  text: string;
-  onCitation: (citation: string) => void;
-}) {
-  const parts = text.split(/(\[[^\]\s]+:\d+-\d+\]|\*\*[^*]+\*\*|`[^`]+`)/g);
-  return (
-    <p className="prose">
-      {parts.map((part, index) => {
-        const citation = part.match(/^\[([^\]\s]+:\d+-\d+)\]$/);
-        if (citation) {
-          return (
-            <button
-              key={index}
-              type="button"
-              className="citation-link"
-              dir="ltr"
-              title={citation[1]}
-              onClick={() => onCitation(citation[1])}
-            >
-              {citationLabel(citation[1])}
-            </button>
-          );
-        }
-        if (part.startsWith("**") && part.endsWith("**")) {
-          return <strong key={index}>{part.slice(2, -2)}</strong>;
-        }
-        if (part.startsWith("`") && part.endsWith("`")) {
-          return (
-            <code key={index} dir="ltr">
-              {part.slice(1, -1)}
-            </code>
-          );
-        }
-        return <span key={index}>{part}</span>;
-      })}
-    </p>
-  );
-}
 
 export default function ChatPage() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -167,6 +101,13 @@ export default function ChatPage() {
   const [busy, setBusy] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  // Lets a turn be cancelled deliberately, and on unmount, instead of
+  // leaving the fetch running with nobody reading it.
+  const abortRef = useRef<AbortController | null>(null);
+  // The selection as of *now*, readable from an async callback that closed
+  // over an older render.
+  const selectedIdRef = useRef<string | null>(null);
+  selectedIdRef.current = selectedId;
 
   // --- retrieval scope (collection / document selectors) ---
   const [textCollections, setTextCollections] = useState<KbCollection[]>([]);
@@ -205,26 +146,60 @@ export default function ChatPage() {
     }
   }, []);
 
-  const loadConversation = useCallback(async (id: string) => {
-    try {
-      const r = await fetch(`${API_URL}/chat/conversations/${id}`);
-      if (r.ok) {
+  /**
+   * Load one conversation's messages.
+   *
+   * `expectedId` guards a late response: a slow load for a conversation the
+   * user has already navigated away from must not overwrite the current one.
+   */
+  const loadConversation = useCallback(
+    async (id: string, expectedId?: string) => {
+      try {
+        const r = await fetch(`${API_URL}/chat/conversations/${id}`);
+        if (!r.ok) return;
         const detail = await r.json();
+        if (expectedId !== undefined && selectedIdRef.current !== expectedId) {
+          return;
+        }
         setMessages(detail.messages);
+      } catch {
+        /* ignore */
       }
-    } catch {
-      /* ignore */
-    }
-  }, []);
+    },
+    []
+  );
 
   useEffect(() => {
     refreshConversations();
     refreshCollections();
   }, [refreshConversations, refreshCollections]);
 
+  // Abandon an in-flight turn when the page goes away.
+  useEffect(() => () => abortRef.current?.abort(), []);
+
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, live]);
+
+  /** Switch conversations, abandoning whatever the current turn was doing. */
+  const selectConversation = useCallback(
+    (id: string) => {
+      if (id === selectedId) return;
+      // Without this, the finished turn's `finally` would reload the *old*
+      // conversation over the newly selected one.
+      abortRef.current?.abort();
+      abortRef.current = null;
+      setLive(null);
+      setBusy(false);
+      setErrorMsg(null);
+      setSource(null);
+      setSourceError(null);
+      setSelectedId(id);
+      setMessages([]);
+      loadConversation(id);
+    },
+    [selectedId, loadConversation]
+  );
 
   // When the text collection changes, load its documents ("parts").
   useEffect(() => {
@@ -258,7 +233,11 @@ export default function ChatPage() {
       setSource(null);
       try {
         const query = new URLSearchParams({ citation });
-        if (scopeText) query.set("collection", scopeText);
+        // A page citation resolves against the visual collection, a text one
+        // against the text collection.
+        const isPage = /#p\d+$/.test(citation);
+        const collection = isPage ? scopePage : scopeText;
+        if (collection) query.set("collection", collection);
         const r = await fetch(`${API_URL}/rag/source?${query}`);
         if (!r.ok) {
           const detail = await r.json().catch(() => ({}));
@@ -271,7 +250,7 @@ export default function ChatPage() {
         setSourceLoading(null);
       }
     },
-    [scopeText]
+    [scopeText, scopePage]
   );
 
   async function newConversation() {
@@ -284,6 +263,10 @@ export default function ChatPage() {
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const created: Conversation = await r.json();
       await refreshConversations();
+      abortRef.current?.abort();
+      abortRef.current = null;
+      setLive(null);
+      setBusy(false);
       setSelectedId(created.id);
       setMessages([]);
     } catch (err) {
@@ -292,12 +275,21 @@ export default function ChatPage() {
   }
 
   async function deleteConversation(id: string) {
+    if (selectedId === id) abortRef.current?.abort();
     await fetch(`${API_URL}/chat/conversations/${id}`, { method: "DELETE" });
     if (selectedId === id) {
       setSelectedId(null);
       setMessages([]);
+      setLive(null);
+      setBusy(false);
     }
     await refreshConversations();
+  }
+
+  function stopTurn() {
+    // The backend persists whatever it generated before the hang-up, so the
+    // partial answer is still in the transcript after the reload.
+    abortRef.current?.abort();
   }
 
   async function sendMessage(e: FormEvent) {
@@ -308,6 +300,12 @@ export default function ChatPage() {
       setErrorMsg("اول یک گفتگو بساز.");
       return;
     }
+    // Captured for the whole turn: `selectedId` may change under us, and
+    // every effect below has to belong to the conversation it started in.
+    const turnId = selectedId;
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setBusy(true);
     setErrorMsg(null);
     setInput("");
@@ -315,7 +313,7 @@ export default function ChatPage() {
       ...prev,
       { id: null, role: "user", content, payload: null },
     ]);
-    setLive({ searches: [], answer: "", citations: [], warnings: [] });
+    setLive({ ...EMPTY_TURN });
 
     const scope: RetrievalScope = {
       text_collection: scopeText || null,
@@ -323,15 +321,14 @@ export default function ChatPage() {
       document_ids: scopeDocument ? [scopeDocument] : null,
     };
 
+    let aborted = false;
     try {
-      const r = await fetch(
-        `${API_URL}/chat/conversations/${selectedId}/messages`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ content, ...scope }),
-        }
-      );
+      const r = await fetch(`${API_URL}/chat/conversations/${turnId}/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content, ...scope }),
+        signal: controller.signal,
+      });
       if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
 
       // POST + SSE: EventSource can't POST, so parse the stream by hand.
@@ -344,24 +341,41 @@ export default function ChatPage() {
         buffer += decoder.decode(value, { stream: true });
         const frames = buffer.split("\n\n");
         buffer = frames.pop() ?? "";
-        for (const frame of frames) {
-          if (!frame.startsWith("data: ")) continue;
-          applyEvent(JSON.parse(frame.slice("data: ".length)));
-        }
+        for (const frame of frames) applyFrame(frame);
       }
+      if (buffer) applyFrame(buffer); // a stream that ended without a blank line
     } catch (err) {
-      setErrorMsg(`ارسال پیام ناموفق بود: ${String(err)}`);
+      aborted = controller.signal.aborted;
+      if (!aborted) setErrorMsg(`ارسال پیام ناموفق بود: ${String(err)}`);
     } finally {
-      setLive(null);
-      setBusy(false);
-      await loadConversation(selectedId);
-      await refreshConversations();
+      if (abortRef.current === controller) abortRef.current = null;
+      // Only touch the view if this turn's conversation is still the one on
+      // screen; otherwise the user has moved on and owns the state now.
+      if (!aborted || turnId === selectedId) {
+        setLive(null);
+        setBusy(false);
+        await loadConversation(turnId, turnId);
+        await refreshConversations();
+      }
+    }
+
+    /** One SSE frame. `: ping` keep-alives and junk are ignored, not fatal. */
+    function applyFrame(frame: string) {
+      const line = frame.trimStart();
+      if (!line.startsWith("data:")) return; // comment frame (heartbeat)
+      let event: Record<string, unknown>;
+      try {
+        event = JSON.parse(line.slice("data:".length));
+      } catch {
+        // A single malformed frame must not abort a good stream.
+        return;
+      }
+      applyEvent(event);
     }
 
     function applyEvent(event: Record<string, unknown>) {
       setLive((prev) => {
-        const turn =
-          prev ?? { searches: [], answer: "", citations: [], warnings: [] };
+        const turn = prev ?? { ...EMPTY_TURN };
         if (event.type === "search") {
           return { ...turn, searches: [...turn.searches, String(event.query)] };
         }
@@ -373,8 +387,13 @@ export default function ChatPage() {
           return {
             ...turn,
             citations: Array.from(new Set(citations)),
-            warnings: [...turn.warnings, ...((event.warnings as string[]) ?? [])],
+            warnings: Array.from(
+              new Set([...turn.warnings, ...((event.warnings as string[]) ?? [])])
+            ),
           };
+        }
+        if (event.type === "reasoning") {
+          return { ...turn, reasoning: turn.reasoning + String(event.text) };
         }
         if (event.type === "delta") {
           return { ...turn, answer: turn.answer + String(event.text) };
@@ -414,10 +433,7 @@ export default function ChatPage() {
               <li
                 key={c.id}
                 className={`conversation-item ${selectedId === c.id ? "selected" : ""}`}
-                onClick={() => {
-                  setSelectedId(c.id);
-                  loadConversation(c.id);
-                }}
+                onClick={() => selectConversation(c.id)}
               >
                 <span className="conversation-title">
                   {c.title || "بدون عنوان"}
@@ -534,7 +550,11 @@ export default function ChatPage() {
                     {m.role === "user" ? "تو" : "دستیار"}
                   </div>
                   {m.role === "assistant" ? (
-                    <AnswerBody text={m.content} onCitation={openSource} />
+                    <AnswerBody
+                      text={m.content}
+                      onCitation={openSource}
+                      partial={m.payload?.partial}
+                    />
                   ) : (
                     <div className="bubble-text">{m.content}</div>
                   )}
@@ -594,19 +614,27 @@ export default function ChatPage() {
                       ))}
                     </div>
                   )}
+                  {live.reasoning && !live.answer && (
+                    <details className="sources reasoning" open>
+                      <summary>در حال استدلال…</summary>
+                      <div className="reasoning-text small">{live.reasoning}</div>
+                    </details>
+                  )}
                   {live.answer ? (
                     <AnswerBody text={live.answer} onCitation={openSource} />
                   ) : (
-                    <div className="thinking">
-                      <span className="dot" />
-                      <span className="dot" />
-                      <span className="dot" />
-                      <span className="muted small">
-                        {live.searches.length
-                          ? "در حال خواندن منابع…"
-                          : "در حال برنامه‌ریزی جستجو…"}
-                      </span>
-                    </div>
+                    !live.reasoning && (
+                      <div className="thinking">
+                        <span className="dot" />
+                        <span className="dot" />
+                        <span className="dot" />
+                        <span className="muted small">
+                          {live.searches.length
+                            ? "در حال خواندن منابع…"
+                            : "در حال برنامه‌ریزی جستجو…"}
+                        </span>
+                      </div>
+                    )
                   )}
                 </article>
               )}
@@ -626,9 +654,15 @@ export default function ChatPage() {
                   }
                 }}
               />
-              <button type="submit" disabled={busy || !input.trim()}>
-                {busy ? "…" : "ارسال"}
-              </button>
+              {busy ? (
+                <button type="button" onClick={stopTurn} title="توقف تولید پاسخ">
+                  توقف
+                </button>
+              ) : (
+                <button type="submit" disabled={!input.trim()}>
+                  ارسال
+                </button>
+              )}
             </form>
             {errorMsg && <p className="error-text pad">{errorMsg}</p>}
           </>
@@ -658,6 +692,20 @@ export default function ChatPage() {
             </button>
           </header>
           {sourceError && <p className="error-text pad">{sourceError}</p>}
+
+          {/* A visual hit has no text: the model was shown the page image. */}
+          {source?.kind === "page" && source.image_url && (
+            <div className="source-chunk">
+              <div className="muted small">صفحهٔ {source.page} از مرجع</div>
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                className="source-page"
+                src={`${API_URL}${source.image_url}`}
+                alt={`صفحهٔ ${source.page} از مستند مرجع`}
+              />
+            </div>
+          )}
+
           {source?.chunks.map((chunk, index) => (
             <div key={index} className="source-chunk">
               <div className="muted small" dir="ltr">
@@ -669,7 +717,7 @@ export default function ChatPage() {
               </pre>
             </div>
           ))}
-          {source && source.chunks.length === 0 && (
+          {source && source.kind !== "page" && source.chunks.length === 0 && (
             <p className="muted pad">برای این ارجاع متنی پیدا نشد.</p>
           )}
         </aside>

@@ -4,6 +4,7 @@ The Chat Agent itself is faked here (it has its own test module); these
 tests care about HTTP semantics and what lands in the database.
 """
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -235,3 +236,173 @@ def test_empty_content_is_rejected(tmp_path: Path, monkeypatch):
         f"/chat/conversations/{conversation_id}/messages", json={"content": "   "}
     )
     assert response.status_code == 422
+
+
+async def _stream_turn(conversation_id: str, content: str):
+    """Start a turn and hand back its raw SSE iterator.
+
+    `TestClient.stream` buffers the whole response before returning, so it
+    cannot express "read two frames, then hang up". Calling the route gives
+    the real `StreamingResponse` whose `body_iterator` can be abandoned
+    exactly the way Starlette abandons it on a disconnect.
+    """
+    generator = app.dependency_overrides[get_session]()
+    session = next(generator)
+    response = await chat_module.send_message(
+        conversation_id,
+        chat_module.MessageCreate(content=content),
+        session=session,
+    )
+    return response.body_iterator
+
+
+def test_a_partial_answer_is_persisted_when_the_client_hangs_up(
+    tmp_path: Path, monkeypatch
+):
+    """A turn cut short mid-stream must not lose what it already generated.
+
+    The provider call is already paid for; dropping it meant a closed tab
+    silently threw away a minute of generation.
+    """
+    client = _setup(tmp_path, monkeypatch)
+    conversation_id = client.post("/chat/conversations", json={}).json()["id"]
+
+    async def never_finishes(question, *, history=None, family=None, **kwargs):
+        yield {"type": "delta", "text": "first half"}
+        yield {"type": "delta", "text": " and more"}
+        # The client goes away here: no `done` event will ever arrive.
+        await asyncio.sleep(30)
+        yield {"type": "done", "answer": "unreachable"}  # pragma: no cover
+
+    monkeypatch.setattr(chat_module, "answer_with_search", never_finishes)
+
+    async def read_two_frames_then_hang_up():
+        stream = await _stream_turn(conversation_id, "explain SPI")
+        frames = [await stream.__anext__(), await stream.__anext__()]
+        # Starlette throws GeneratorExit into the body iterator when the
+        # client disconnects; `aclose` is that, exactly.
+        await stream.aclose()
+        return frames
+
+    frames = asyncio.run(read_two_frames_then_hang_up())
+    assert "first half" in frames[0]
+
+    detail = client.get(f"/chat/conversations/{conversation_id}").json()
+    assert [m["role"] for m in detail["messages"]] == ["user", "assistant"]
+    assistant = detail["messages"][1]
+    assert assistant["content"] == "first half and more"
+    assert assistant["payload"]["partial"] is True
+    assert assistant["payload"]["failed"] is True
+
+
+def test_a_quiet_agent_still_sends_heartbeats(tmp_path: Path, monkeypatch):
+    """Nothing may be silent long enough for a proxy to close the connection."""
+    client = _setup(tmp_path, monkeypatch)
+    conversation_id = client.post("/chat/conversations", json={}).json()["id"]
+
+    monkeypatch.setattr(chat_module.settings, "chat_heartbeat_seconds", 1.0)
+
+    async def slow_planner(question, *, history=None, family=None, **kwargs):
+        await asyncio.sleep(2.5)  # planning, no output
+        yield {
+            "type": "done",
+            "answer": "done at last",
+            "citations": [],
+            "cited": [],
+            "grounded": False,
+            "verified": False,
+            "searches": [],
+            "scope": None,
+            "warnings": [],
+            "failed": False,
+        }
+
+    monkeypatch.setattr(chat_module, "answer_with_search", slow_planner)
+
+    async def drain():
+        stream = await _stream_turn(conversation_id, "slow one")
+        return [frame async for frame in stream]
+
+    frames = asyncio.run(drain())
+    body = "".join(frames)
+
+    assert body.count(": ping\n\n") >= 2
+    # The comment frames must not be mistaken for events by a parser.
+    events = [
+        json.loads(frame.removeprefix("data: "))
+        for frame in body.split("\n\n")
+        if frame.startswith("data: ")
+    ]
+    assert [e["type"] for e in events] == ["done"]
+
+    detail = client.get(f"/chat/conversations/{conversation_id}").json()
+    assert detail["messages"][1]["content"] == "done at last"
+    assert detail["messages"][1]["payload"]["partial"] is False
+
+
+def test_an_agent_crash_persists_what_was_streamed(tmp_path: Path, monkeypatch):
+    client = _setup(tmp_path, monkeypatch)
+    conversation_id = client.post("/chat/conversations", json={}).json()["id"]
+
+    async def crashes(question, *, history=None, family=None, **kwargs):
+        yield {"type": "delta", "text": "partial thought"}
+        raise RuntimeError("provider exploded")
+
+    monkeypatch.setattr(chat_module, "answer_with_search", crashes)
+
+    with client.stream(
+        "POST",
+        f"/chat/conversations/{conversation_id}/messages",
+        json={"content": "boom"},
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert '"type": "error"' in body
+    detail = client.get(f"/chat/conversations/{conversation_id}").json()
+    assert detail["messages"][1]["content"] == "partial thought"
+    assert detail["messages"][1]["payload"]["partial"] is True
+
+
+def test_a_turn_that_generated_nothing_stores_no_empty_message(
+    tmp_path: Path, monkeypatch
+):
+    client = _setup(tmp_path, monkeypatch)
+    conversation_id = client.post("/chat/conversations", json={}).json()["id"]
+
+    async def silent(question, *, history=None, family=None, **kwargs):
+        raise RuntimeError("died before the first token")
+        yield {}  # pragma: no cover - unreachable, makes this a generator
+
+    monkeypatch.setattr(chat_module, "answer_with_search", silent)
+
+    with client.stream(
+        "POST",
+        f"/chat/conversations/{conversation_id}/messages",
+        json={"content": "nothing comes back"},
+    ) as response:
+        "".join(response.iter_text())
+
+    detail = client.get(f"/chat/conversations/{conversation_id}").json()
+    assert [m["role"] for m in detail["messages"]] == ["user"]
+
+
+def test_an_unreadable_payload_does_not_break_the_conversation(
+    tmp_path: Path, monkeypatch
+):
+    client = _setup(tmp_path, monkeypatch)
+    conversation_id = client.post("/chat/conversations", json={}).json()["id"]
+
+    with Session(chat_module.engine) as session:
+        session.add(
+            chat_module.Message(
+                conversation_id=conversation_id,
+                role="assistant",
+                content="an answer",
+                payload="{not json at all",
+            )
+        )
+        session.commit()
+
+    detail = client.get(f"/chat/conversations/{conversation_id}")
+    assert detail.status_code == 200
+    assert detail.json()["messages"][0]["payload"] is None

@@ -20,6 +20,7 @@ Events (yielded by `answer_with_search`, mapped 1:1 to SSE by the API):
 
   * {"type": "search", ...}          a retrieval was planned and started
   * {"type": "search_result", ...}   what that retrieval brought back
+  * {"type": "reasoning", ...}       a reasoning-trace token (not the answer)
   * {"type": "delta", ...}           one answer token
   * {"type": "done", ...}            final answer + metadata
 """
@@ -36,7 +37,7 @@ from app.agents.datasheet import detect_family
 from app.core.config import settings
 from app.core.llm import get_agent_llm
 from app.orchestrator.contracts import ContractError
-from app.rag import RagContext, get_rag_client
+from app.rag import RagContext, dedupe, get_rag_client
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +125,28 @@ def _trim_history(
     return trimmed
 
 
+def _search_result_event(query: str, context: RagContext) -> dict[str, Any]:
+    """The `search_result` event for one retrieval.
+
+    One definition, because every path that runs a search emits the same
+    shape and they must not drift apart.
+    """
+    return {
+        "type": "search_result",
+        "query": query,
+        "available": context.available,
+        "citations": context.citations(),
+        "sources": {
+            "symbols": len(context.symbols),
+            "types": len(context.type_context),
+            "chunks": len(context.chunks),
+            "pages": len(context.pages),
+        },
+        # Only real problems reach the UI; `context.notes` stays server-side.
+        "warnings": list(context.warnings),
+    }
+
+
 def _summarize_results(query: str, context: RagContext) -> str:
     """Compact feedback for the planner: what the search brought back.
 
@@ -204,6 +227,14 @@ async def answer_with_search(
         "document_ids": document_ids,
     }
 
+    llm = get_agent_llm(AGENT_NAME)
+    rag = get_rag_client()
+    warnings: list[str] = []
+    contexts: list[RagContext] = []
+    searches: list[str] = []
+    max_searches = max(1, settings.chat_max_searches)
+    planning_failed = False
+
     async def _run_search(query: str) -> RagContext:
         return await rag.search(
             query,
@@ -212,14 +243,6 @@ async def answer_with_search(
             page_collection=page_collection,
             document_ids=document_ids,
         )
-
-    llm = get_agent_llm(AGENT_NAME)
-    rag = get_rag_client()
-    warnings: list[str] = []
-    contexts: list[RagContext] = []
-    searches: list[str] = []
-    max_searches = max(1, settings.chat_max_searches)
-    planning_failed = False
 
     # ---- decision loop: plan searches until "ready" or the cap ----
     decision: list[dict[str, str]] = [
@@ -250,25 +273,22 @@ async def answer_with_search(
             break
 
         query = action.query.strip()
+        if query.casefold() in {seen.casefold() for seen in searches}:
+            # A planner that repeats itself would burn the whole budget on
+            # one query and duplicate its results in the context. The repeat
+            # is the signal that it has nothing left to ask.
+            logger.info("chat planner repeated query %r; treating as ready", query)
+            break
+
         searches.append(query)
         yield {"type": "search", "query": query, "index": len(searches), "max": max_searches}
 
         context = await _run_search(query)
         contexts.append(context)
-        yield {
-            "type": "search_result",
-            "query": query,
-            "available": context.available,
-            "citations": context.citations(),
-            "sources": {
-                "symbols": len(context.symbols),
-                "types": len(context.type_context),
-                "chunks": len(context.chunks),
-                "pages": len(context.pages),
-            },
-            "warnings": list(context.warnings),
-        }
+        yield _search_result_event(query, context)
         warnings.extend(context.warnings)
+        if context.notes:
+            logger.debug("retrieval notes for %r: %s", query, context.notes)
 
         if not context.available:
             # The knowledge base is down; further searches fail identically.
@@ -280,59 +300,40 @@ async def answer_with_search(
             {"role": "user", "content": _summarize_results(query, context)},
         ]
 
-    if planning_failed and not searches:
-        # Fall back to the retrieve-before-prompting doctrine: even without
-        # a planner, one direct search with the raw question beats nothing.
+    if not searches:
+        # Either the planner broke, or it judged the question answerable
+        # without retrieval. Both land on the retrieve-before-prompting
+        # doctrine: one direct search with the raw question beats nothing.
         query = question
         searches.append(query)
         yield {"type": "search", "query": query, "index": 1, "max": max_searches}
         context = await _run_search(query)
         contexts.append(context)
-        yield {
-            "type": "search_result",
-            "query": query,
-            "available": context.available,
-            "citations": context.citations(),
-            "sources": {
-                "symbols": len(context.symbols),
-                "types": len(context.type_context),
-                "chunks": len(context.chunks),
-                "pages": len(context.pages),
-            },
-            "warnings": list(context.warnings),
-        }
+        yield _search_result_event(query, context)
         warnings.extend(context.warnings)
-    elif not searches:
-        # The planner judged the question answerable without retrieval. It
-        # is still answered grounded: one search with the raw question.
-        query = question
-        searches.append(query)
-        yield {"type": "search", "query": query, "index": 1, "max": max_searches}
-        context = await _run_search(query)
-        contexts.append(context)
-        yield {
-            "type": "search_result",
-            "query": query,
-            "available": context.available,
-            "citations": context.citations(),
-            "sources": {
-                "symbols": len(context.symbols),
-                "types": len(context.type_context),
-                "chunks": len(context.chunks),
-                "pages": len(context.pages),
-            },
-            "warnings": list(context.warnings),
-        }
-        warnings.extend(context.warnings)
+        if context.notes:
+            logger.debug("retrieval notes for %r: %s", query, context.notes)
 
     # ---- answer phase: stream the cited answer ----
     answer_messages = _build_answer_messages(question, history, contexts)
     answer = ""
     failed = False
     try:
-        async for delta in llm.stream(answer_messages, temperature=0):
-            answer += delta
-            yield {"type": "delta", "text": delta}
+        # Reasoning models emit their trace before any visible token; it is
+        # forwarded as its own event so the UI can show progress, and never
+        # mixed into the answer.
+        events = getattr(llm, "stream_events", None)
+        if events is None:
+            async for delta in llm.stream(answer_messages, temperature=0):
+                answer += delta
+                yield {"type": "delta", "text": delta}
+        else:
+            async for kind, text in events(answer_messages, temperature=0):
+                if kind == "reasoning":
+                    yield {"type": "reasoning", "text": text}
+                    continue
+                answer += text
+                yield {"type": "delta", "text": text}
     except Exception as exc:
         logger.warning("chat answer streaming failed: %s", exc)
         detail = str(exc) or f"{type(exc).__module__}.{type(exc).__name__}"
@@ -358,6 +359,7 @@ async def answer_with_search(
         "verified": bool(cited),
         "searches": searches,
         "scope": scope,
-        "warnings": warnings,
+        "warnings": dedupe(warnings),
         "failed": failed,
+        "planning_failed": planning_failed,
     }

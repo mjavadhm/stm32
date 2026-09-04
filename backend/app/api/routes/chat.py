@@ -5,14 +5,19 @@ Conversations and messages are persisted; each turn runs the Chat Agent
 delivered as Server-Sent Events so the UI can render searches and answer
 tokens as they happen.
 
-The user message is committed *before* streaming begins: a question must
-survive an agent failure, not vanish with the connection.
+The user message is committed *before* streaming begins, and the assistant
+message is committed on *every* exit path -- normal completion, agent
+failure, or the client hanging up mid-stream. A turn costs real provider
+time; none of it may be lost because a browser tab closed.
 """
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -20,6 +25,7 @@ from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
 from app.agents.qa import answer_with_search
+from app.core.config import settings
 from app.db.models import Conversation, Message, utcnow
 from app.db.session import engine, get_session
 
@@ -37,12 +43,27 @@ def _conversation_summary(conversation: Conversation) -> dict:
     }
 
 
+def _payload_out(message: Message) -> dict | None:
+    """Decode a stored payload, tolerating a corrupt one.
+
+    A single unreadable row must not 500 the whole conversation: the
+    message text is the part the user came for, the metadata is a bonus.
+    """
+    if not message.payload:
+        return None
+    try:
+        return json.loads(message.payload)
+    except (ValueError, TypeError):
+        logger.warning("message %s has an unreadable payload", message.id)
+        return None
+
+
 def _message_out(message: Message) -> dict:
     return {
         "id": message.id,
         "role": message.role,
         "content": message.content,
-        "payload": json.loads(message.payload) if message.payload else None,
+        "payload": _payload_out(message),
         "created_at": message.created_at,
     }
 
@@ -161,24 +182,126 @@ async def send_message(
     }
 
     async def event_stream() -> AsyncIterator[str]:
-        # The request's session may close before a long stream ends; use a
-        # fresh one for the writes that happen on completion.
-        done_event: dict | None = None
+        # The request's session may close before a long stream ends; the
+        # writes below use a fresh one.
+        state: dict[str, Any] = {"done": None, "answer": "", "aborted": False}
         try:
-            async for event in answer_with_search(
-                question, history=history, family=family, **scope_kwargs
+            async for event in _with_heartbeat(
+                answer_with_search(
+                    question, history=history, family=family, **scope_kwargs
+                ),
+                state,
             ):
-                if event["type"] == "done":
-                    done_event = event
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                yield event
+        except (asyncio.CancelledError, GeneratorExit):
+            # The client hung up. Everything generated so far is already
+            # paid for, so record it and re-raise: swallowing a
+            # CancelledError leaves the task in an undefined state.
+            state["aborted"] = True
+            _persist_turn(conversation_id, state)
+            raise
         except Exception as exc:  # the agent never raises; belt and braces
             logger.exception("chat turn failed unexpectedly")
-            yield f'data: {json.dumps({"type": "error", "detail": str(exc)})}\n\n'
-
-        if done_event is None:
-            yield 'data: {"type": "error", "detail": "stream ended without a done event"}\n\n'
+            state["aborted"] = True
+            yield _frame({"type": "error", "detail": str(exc)})
+            _persist_turn(conversation_id, state)
             return
 
+        if state["done"] is None:
+            state["aborted"] = True
+            yield _frame(
+                {"type": "error", "detail": "stream ended without a done event"}
+            )
+        _persist_turn(conversation_id, state)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _frame(event: dict) -> str:
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+async def _with_heartbeat(
+    events: AsyncIterator[dict], state: dict[str, Any]
+) -> AsyncIterator[str]:
+    """Serialise agent events, emitting a comment while the agent is quiet.
+
+    Retrieval planning on a reasoning model can take a minute before the
+    first token, and a connection that carries no bytes for that long is
+    closed by proxies (nginx `proxy_read_timeout` defaults to 60s). A
+    `: ping` comment is ignored by every SSE parser but resets the clock.
+
+    Answer text is accumulated in `state` as it passes, so a turn cut short
+    can still be persisted.
+    """
+    interval = max(1.0, settings.chat_heartbeat_seconds)
+    iterator = events.__aiter__()
+    pending: asyncio.Future | None = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(iterator.__anext__())
+            # `wait` leaves the task running on timeout, so the same step is
+            # still in flight across however many pings it needs.
+            finished, _ = await asyncio.wait({pending}, timeout=interval)
+            if not finished:
+                yield ": ping\n\n"
+                continue
+            try:
+                event = pending.result()
+            except StopAsyncIteration:
+                return
+            finally:
+                pending = None
+            # Record before yielding: the yield is where a disconnect
+            # raises, and a delta already seen must not be lost with it.
+            if event["type"] == "delta":
+                state["answer"] += event.get("text", "")
+            elif event["type"] == "done":
+                state["done"] = event
+            yield _frame(event)
+    finally:
+        # Stop the in-flight step and let the agent generator unwind, so a
+        # disconnect never leaves an orphaned provider call behind.
+        if pending is not None:
+            pending.cancel()
+            try:
+                await pending
+            except BaseException:  # noqa: BLE001 - cleanup, any outcome is fine
+                pass
+        with suppress(BaseException):  # noqa: BLE001
+            await iterator.aclose()  # type: ignore[attr-defined]
+
+
+def _persist_turn(conversation_id: str, state: dict[str, Any]) -> None:
+    """Write the assistant message, whether or not the turn finished.
+
+    An aborted turn is stored with `partial: true` so the UI can mark it as
+    incomplete rather than presenting a truncated answer as final.
+    """
+    done = state["done"]
+    answer = done["answer"] if done else state["answer"]
+    if not answer.strip():
+        # Nothing was generated: a bare "" message would only add noise to
+        # the transcript and to the next turn's history.
+        return
+
+    metadata = {
+        "citations": done["citations"] if done else [],
+        "cited": done["cited"] if done else [],
+        "grounded": done["grounded"] if done else False,
+        "verified": done["verified"] if done else False,
+        "searches": done["searches"] if done else [],
+        "scope": done.get("scope") if done else None,
+        "warnings": done["warnings"] if done else ["turn ended before completion"],
+        "failed": done["failed"] if done else True,
+        "partial": done is None,
+    }
+    try:
         with Session(engine) as write_session:
             conversation = write_session.get(Conversation, conversation_id)
             if conversation is not None:
@@ -188,26 +311,10 @@ async def send_message(
                 Message(
                     conversation_id=conversation_id,
                     role="assistant",
-                    content=done_event["answer"],
-                    payload=json.dumps(
-                        {
-                            "citations": done_event["citations"],
-                            "cited": done_event["cited"],
-                            "grounded": done_event["grounded"],
-                            "verified": done_event["verified"],
-                            "searches": done_event["searches"],
-                            "scope": done_event.get("scope"),
-                            "warnings": done_event["warnings"],
-                            "failed": done_event["failed"],
-                        },
-                        ensure_ascii=False,
-                    ),
+                    content=answer,
+                    payload=json.dumps(metadata, ensure_ascii=False),
                 )
             )
             write_session.commit()
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    except Exception:  # pragma: no cover - a failed write must not mask the turn
+        logger.exception("persisting the assistant message failed")

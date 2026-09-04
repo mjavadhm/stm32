@@ -7,6 +7,9 @@ chat UI's scope selectors ("ask against this collection, or only this
 document").
 """
 
+import re
+from urllib.parse import quote
+
 from fastapi import APIRouter, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
@@ -119,17 +122,44 @@ async def rag_collections() -> dict:
     }
 
 
+# A visual citation is `<document_id>#p<page>`; a text one is `path:a-b`.
+_PAGE_CITATION_RE = re.compile(r"^(?P<document>[^#\s]+)#p(?P<page>\d+)$")
+
+
 @router.get("/source")
 async def rag_source(
-    citation: str = Query(min_length=1, description="path:line_start-line_end"),
+    citation: str = Query(min_length=1, description="path:line_start-line_end or id#pN"),
     collection: str | None = None,
 ) -> dict:
-    """The source text behind a citation, so an answer can be checked.
+    """The source behind a citation, so an answer can be checked.
 
-    A citation is `path:start-end` (or a bare path). The document is found
-    by path in the collection, then the chunks overlapping that line range
-    are returned -- that is exactly the excerpt the model was shown.
+    Two citation shapes exist, because two channels produce them:
+
+    * `path:start-end` -- a text chunk. The document is found by path in the
+      collection, then the chunks overlapping that line range are returned:
+      exactly the excerpt the model was shown.
+    * `<document_id>#p<page>` -- a reference-manual page. There is no text to
+      return (the model was shown an image), so the answer is a pointer to
+      the proxied page image.
     """
+    page_match = _PAGE_CITATION_RE.match(citation.strip())
+    if page_match:
+        document_id = page_match["document"]
+        page = int(page_match["page"])
+        return {
+            "citation": citation,
+            "kind": "page",
+            "collection": collection or settings.rag_page_collection,
+            "document_id": document_id,
+            "path": f"{document_id} · page {page}",
+            "page": page,
+            "lines": None,
+            # Relative on purpose: the browser already talks to this API and
+            # cannot reach PageVault directly.
+            "image_url": f"/rag/page?document_id={quote(document_id)}&page={page}",
+            "chunks": [],
+        }
+
     path, _, lines = citation.rpartition(":")
     start = end = 0
     if path and "-" in lines:
@@ -165,6 +195,7 @@ async def rag_source(
     matched = [c for c in chunks if overlaps(c)]
     return {
         "citation": citation,
+        "kind": "text",
         "collection": target,
         "document_id": document["id"],
         "path": path,
@@ -183,7 +214,11 @@ async def rag_source(
 
 @router.get("/page")
 async def rag_page(
-    document_id: str = Query(min_length=1), page: int = Query(ge=1)
+    # Constrained rather than free-form: this value is interpolated into a
+    # PageVault URL path, and a `../` in it would let a caller aim this
+    # proxy at any endpoint of an internal service.
+    document_id: str = Query(min_length=1, max_length=200, pattern=r"^[A-Za-z0-9._-]+$"),
+    page: int = Query(ge=1, le=10000),
 ) -> Response:
     """Proxy one indexed PDF page image (the browser cannot reach PageVault)."""
     content, media_type, warning = await get_rag_client().fetch_page_image(

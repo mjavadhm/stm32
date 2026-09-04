@@ -41,7 +41,9 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 0
     # Separate ceiling for streamed answers, or 0 to leave unbounded.
     # Reasoning models burn hundreds of hidden reasoning tokens before the
-    # first visible one, so the plain ceiling must not clip a stream.
+    # first visible one, so the plain ceiling must not clip a stream. This
+    # stands on its own: setting it alone is enough, and llm_max_tokens is
+    # never applied to a stream.
     llm_stream_max_tokens: int = 0
     # A model is considered a reasoning model when its name matches this
     # (substring, case-insensitive). Planning calls are pure JSON decisions
@@ -95,6 +97,11 @@ class Settings(BaseSettings):
     # The chat agent plans its own retrieval: per question it may run at most
     # this many searches before it has to answer with what it has collected.
     chat_max_searches: int = 3
+    # Planning on a reasoning model can take a minute before the first
+    # token. An SSE connection that carries no bytes for that long is closed
+    # by proxies (nginx proxy_read_timeout defaults to 60s), so a comment
+    # frame is sent whenever the agent has been quiet this long.
+    chat_heartbeat_seconds: float = 15.0
 
     # --- Build sandbox (M4) ---
     # Compilation happens in a separate container that has no route to the

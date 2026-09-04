@@ -352,3 +352,103 @@ def test_history_is_trimmed_and_normalised(monkeypatch):
     assert len(planning_messages) == 1 + qa.MAX_HISTORY_MESSAGES + 1
     assert planning_messages[0]["role"] == "system"
     assert planning_messages[-1]["content"] == "question"
+
+
+def test_a_repeated_planned_query_is_not_searched_twice(monkeypatch):
+    """A planner that repeats itself has nothing left to ask.
+
+    Running the same query again would burn the search budget and duplicate
+    its results in the answer context.
+    """
+    captured: list[dict] = []
+    llm = FakeLLM(
+        replies=[
+            '{"action": "search", "query": "SPI DMA"}',
+            '{"action": "search", "query": "spi dma"}',  # same query, other case
+            '{"action": "ready"}',
+        ],
+        chunks=["answer [RM0090.md:10-60]"],
+    )
+    _install(monkeypatch, llm, _rag(_ok_handler(captured)))
+
+    events = _run(qa.answer_with_search(QUESTION))
+
+    assert [e["type"] for e in events] == ["search", "search_result", "delta", "done"]
+    assert events[-1]["searches"] == ["SPI DMA"]
+    assert len([r for r in captured if r["path"] == "/text/search"]) == 1
+
+
+def test_a_symbol_skip_is_not_shown_to_the_user(monkeypatch):
+    """Retrieval plumbing must not surface as a warning in the chat."""
+    llm = FakeLLM(
+        replies=['{"action": "search", "query": "configure a timer"}', '{"action": "ready"}'],
+        chunks=["answer [RM0090.md:10-60]"],
+    )
+    _install(monkeypatch, llm, _rag(_ok_handler()))
+
+    events = _run(qa.answer_with_search("چطور یک تایمر را تنظیم کنم؟"))
+
+    result = next(e for e in events if e["type"] == "search_result")
+    assert result["warnings"] == []
+    assert events[-1]["warnings"] == []
+
+
+def test_repeated_warnings_are_reported_once(monkeypatch):
+    """Two searches against one dead channel is one problem, not two."""
+
+    def dead_visual(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/search":
+            raise httpx.ConnectError("visual down", request=request)
+        return _ok_handler()(request)
+
+    llm = FakeLLM(
+        replies=[
+            '{"action": "search", "query": "first"}',
+            '{"action": "search", "query": "second"}',
+            '{"action": "ready"}',
+        ],
+        chunks=["answer [RM0090.md:10-60]"],
+    )
+    _install(monkeypatch, llm, _rag(dead_visual))
+
+    done = _run(qa.answer_with_search(QUESTION))[-1]
+
+    assert done["searches"] == ["first", "second"]
+    assert len(done["warnings"]) == len(set(done["warnings"]))
+    assert any("visual" in warning for warning in done["warnings"])
+
+
+def test_reasoning_tokens_are_streamed_apart_from_the_answer(monkeypatch):
+    """A reasoning trace shows progress but must never enter the answer."""
+
+    class ReasoningLLM(FakeLLM):
+        async def stream_events(self, messages, **kwargs):
+            self.stream_calls.append(messages)
+            yield "reasoning", "let me check the manual"
+            for chunk in self.chunks:
+                yield "content", chunk
+
+    llm = ReasoningLLM(
+        replies=['{"action": "ready"}'],
+        chunks=["answer [RM0090.md:10-60]"],
+    )
+    _install(monkeypatch, llm, _rag(_ok_handler()))
+
+    events = _run(qa.answer_with_search(QUESTION))
+    types = [e["type"] for e in events]
+
+    assert "reasoning" in types
+    assert types.index("reasoning") < types.index("delta")
+    done = events[-1]
+    assert done["answer"] == "answer [RM0090.md:10-60]"
+    assert "let me check" not in done["answer"]
+
+
+def test_an_llm_without_stream_events_still_works(monkeypatch):
+    """The plain `stream` path stays supported (fakes, older providers)."""
+    llm = FakeLLM(replies=['{"action": "ready"}'], chunks=["plain ", "answer"])
+    assert not hasattr(llm, "stream_events")
+    _install(monkeypatch, llm, _rag(_ok_handler()))
+
+    done = _run(qa.answer_with_search(QUESTION))[-1]
+    assert done["answer"] == "plain answer"

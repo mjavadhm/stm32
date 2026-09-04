@@ -64,7 +64,13 @@ class RagContext:
     type_context: list[Snippet] = field(default_factory=list)
     pages: list[Snippet] = field(default_factory=list)
     identifiers: list[str] = field(default_factory=list)
+    # Things that went wrong and that a human could act on. Surfaced in the
+    # UI, so a channel that merely had nothing to do does not belong here.
     warnings: list[str] = field(default_factory=list)
+    # Things that merely explain the shape of this retrieval ("the symbol
+    # channel had no identifier to look up"). Useful when tuning recall,
+    # noise for the person asking the question.
+    notes: list[str] = field(default_factory=list)
     available: bool = True
 
     @property
@@ -120,6 +126,21 @@ class RagContext:
         return rendered
 
 
+def dedupe(items: list[str]) -> list[str]:
+    """Order-preserving unique.
+
+    Three searches hitting one dead channel is one thing wrong, not three,
+    and the chat agent concatenates the warnings of every search it ran.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
 def _above_score(snippets: list[Snippet], min_score: float) -> list[Snippet]:
     """Drop low-confidence hits.
 
@@ -168,14 +189,29 @@ def _snippet_from_symbol(
 
 
 def _snippet_from_page(raw: dict[str, Any]) -> Snippet:
-    page_number = raw.get("page_number")
+    """A visual page hit.
+
+    The citation has to survive a round trip through the model and back to
+    the UI, which resolves it against `/rag/page`. Both the document id and
+    the page number therefore live in the path, and the filename (when
+    PageVault reports one) is carried as metadata for a readable label.
+    """
+    page_number = int(raw.get("page_number") or 0)
+    document_id = raw.get("document_id", "document")
+    metadata = raw.get("metadata") or {}
     return Snippet(
         channel="page",
         name=f"page {page_number}",
-        path=f"{raw.get('document_id', 'document')}#p{page_number}",
+        path=f"{document_id}#p{page_number}",
         text="",  # Visual hit: the page image, not text.
         score=float(raw.get("score") or 0.0),
-        metadata={"image_url": raw.get("image_url", ""), **(raw.get("metadata") or {})},
+        metadata={
+            "image_url": raw.get("image_url", ""),
+            "document_id": document_id,
+            "page_number": page_number,
+            "filename": raw.get("filename") or metadata.get("filename", ""),
+            **metadata,
+        },
     )
 
 
@@ -260,6 +296,7 @@ class PageVaultClient:
         )
 
         warnings: list[str] = []
+        notes: list[str] = []
         # (name, enabled, warning, failed) per channel. `failed` only counts
         # when the channel actually ran and its call(s) did not answer; a
         # channel disabled by top_k=0 is neither a success nor a failure.
@@ -287,8 +324,11 @@ class PageVaultClient:
         )
         # The symbol channel "runs" only when the question actually names an
         # identifier; a skip makes zero HTTP calls and must not count as the
-        # knowledge base having answered.
+        # knowledge base having answered -- nor as something being wrong,
+        # which is why it is a note and not a warning.
         symbol_attempted = symbol_on and bool(identifiers)
+        if symbol_on and not identifiers:
+            notes.append("symbol channel skipped: no C-like identifier in the query")
         outcomes.append(("symbol", symbol_attempted, symbol_warning, symbol_failed))
 
         type_context, type_warning, _type_failed = await self._expand_types(
@@ -302,6 +342,7 @@ class PageVaultClient:
                 warnings.append(warning)
         if type_warning:
             warnings.append(type_warning)
+        warnings = dedupe(warnings)
 
         attempted = [name for name, on, _w, _f in outcomes if on]
         succeeded = [name for name, on, _w, failed in outcomes if on and not failed]
@@ -312,6 +353,7 @@ class PageVaultClient:
                 query=query,
                 available=False,
                 warnings=warnings or ["knowledge base unavailable"],
+                notes=notes,
             )
 
         return RagContext(
@@ -322,6 +364,7 @@ class PageVaultClient:
             pages=pages,
             identifiers=identifiers,
             warnings=warnings,
+            notes=notes,
             available=True,
         )
 
@@ -430,9 +473,10 @@ class PageVaultClient:
         if limit <= 0:
             return [], None, False
         if not identifiers:
-            # Not a failure: the question simply names no identifier. An
-            # empty symbol slot is better than substring noise.
-            return [], "symbol channel skipped: no C-like identifier found in the query", False
+            # Not a failure and not a warning: the question simply names no
+            # identifier. `search` records that as a note. An empty symbol
+            # slot is better than substring noise.
+            return [], None, False
 
         out: list[Snippet] = []
         seen: set[tuple[str, str]] = set()
@@ -452,7 +496,10 @@ class PageVaultClient:
                 data = response.json()
             except Exception as exc:
                 logger.warning("symbol channel failed for %s: %s", term, exc)
-                return [], self._channel_error("symbol", exc), True
+                # Keep what earlier terms already found: a transient error on
+                # the third identifier is no reason to discard the first two.
+                # The channel only counts as failed when it found nothing.
+                return out, self._channel_error("symbol", exc), not out
             if data.get("match") not in ("exact", "prefix"):
                 continue
             for raw in data.get("results", []):

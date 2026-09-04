@@ -117,3 +117,79 @@ def test_pipeline_marks_progress_and_attributes_failures():
     assert "started_at" in WORKER_SOURCE
     assert "_close_unfinished" in WORKER_SOURCE, "abandoned tasks must not stay pending"
     assert "current_agent" in WORKER_SOURCE, "failures must name the agent that raised"
+
+
+def test_the_stream_ceiling_stands_on_its_own():
+    """LLM_STREAM_MAX_TOKENS used to need LLM_MAX_TOKENS set too.
+
+    It defaults to 0, so setting only the stream ceiling did nothing at all
+    -- the opposite of what the setting says.
+    """
+    import asyncio
+
+    from app.core.config import settings
+
+    sent: dict = {}
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            sent.update(kwargs)
+
+            async def empty():
+                return
+                yield  # pragma: no cover
+
+            return empty()
+
+    class FakeClient:
+        chat = type("C", (), {"completions": FakeCompletions()})()
+
+    agent = llm_module.AgentLLM(agent_name="chat", client=FakeClient(), model="glm-5")
+
+    async def drain(**kwargs):
+        sent.clear()
+        async for _ in agent.stream([{"role": "user", "content": "hi"}], **kwargs):
+            pass  # pragma: no cover
+
+    original = (settings.llm_max_tokens, settings.llm_stream_max_tokens)
+    try:
+        settings.llm_max_tokens = 0
+        settings.llm_stream_max_tokens = 1234
+        asyncio.run(drain())
+        assert sent["max_tokens"] == 1234
+
+        # And the non-streaming ceiling never leaks into a stream.
+        settings.llm_stream_max_tokens = 0
+        settings.llm_max_tokens = 99
+        asyncio.run(drain())
+        assert "max_tokens" not in sent
+
+        # A caller-supplied ceiling is dropped too: it is the clipping bug.
+        asyncio.run(drain(max_tokens=5))
+        assert "max_tokens" not in sent
+    finally:
+        settings.llm_max_tokens, settings.llm_stream_max_tokens = original
+
+
+def test_a_junk_reasoning_pattern_does_not_match_every_model():
+    """An empty regex matches everything, which would slow every model down."""
+    from app.core.config import settings
+
+    original = settings.llm_reasoning_model_pattern
+    try:
+        for pattern in ("", "none", "[unclosed"):
+            settings.llm_reasoning_model_pattern = pattern
+            agent = llm_module.AgentLLM(
+                agent_name="chat", client=object(), model="glm-5.3"
+            )
+            assert agent._is_reasoning_model() is False, pattern
+
+        settings.llm_reasoning_model_pattern = "glm|o3"
+        agent = llm_module.AgentLLM(agent_name="chat", client=object(), model="GLM-5.3")
+        assert agent._is_reasoning_model() is True
+        agent = llm_module.AgentLLM(
+            agent_name="chat", client=object(), model="gpt-4o-mini"
+        )
+        assert agent._is_reasoning_model() is False
+    finally:
+        settings.llm_reasoning_model_pattern = original
