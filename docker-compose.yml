@@ -1,3 +1,10 @@
+# Host ports are deliberately in the 19xxx range: IANA leaves it unassigned and
+# Linux picks ephemeral ports from 32768+, so nothing here collides with a stock
+# Postgres/Redis/Qdrant already on the box. Container-internal ports are
+# unchanged -- service-to-service DNS still uses 5432/6379/6333/8000/9000.
+#
+# Override any of them in .env. INFRA_BIND keeps the datastores on loopback;
+# set it to 0.0.0.0 only if you really need them reachable off-box.
 services:
   postgres:
     image: postgres:16-alpine
@@ -6,7 +13,9 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stm32ai}
       POSTGRES_DB: ${POSTGRES_DB:-stm32ai}
     ports:
-      - "5432:5432"
+      # Loopback only: the password defaults to `stm32ai`, so this must not be
+      # world-reachable. `make`/scripts talk to it via `docker compose exec`.
+      - "${INFRA_BIND:-127.0.0.1}:${POSTGRES_PORT:-19432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -26,7 +35,8 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      # Loopback only: no auth configured.
+      - "${INFRA_BIND:-127.0.0.1}:${REDIS_PORT:-19379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -45,8 +55,9 @@ services:
   qdrant:
     image: qdrant/qdrant:v1.12.4
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      # Loopback only: no auth configured.
+      - "${INFRA_BIND:-127.0.0.1}:${QDRANT_PORT:-19333}:6333"
+      - "${INFRA_BIND:-127.0.0.1}:${QDRANT_GRPC_PORT:-19334}:6334"
     volumes:
       - qdrant_data:/qdrant/storage
     networks:
@@ -58,8 +69,14 @@ services:
   backend:
     build: ./backend
     env_file: .env
+    # `environment` wins over `env_file`, and Compose interpolates ${...} from
+    # ./.env -- so setting CORS_ORIGINS in .env still works, and if you don't,
+    # it tracks FRONTEND_PORT automatically instead of silently staying at 3000.
+    # Must be a JSON array: pydantic-settings rejects a comma-separated list.
+    environment:
+      CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:${FRONTEND_PORT:-19300}"]}
     ports:
-      - "8000:8000"
+      - "${BACKEND_PORT:-19800}:8000"
     volumes:
       - ./backend:/app
       # Generated projects live here. The builder mounts the same volume, so
@@ -140,9 +157,12 @@ services:
   frontend:
     build: ./frontend
     ports:
-      - "3000:3000"
+      - "${FRONTEND_PORT:-19300}:3000"
     environment:
-      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+      # Baked into the browser bundle, so it must be the URL the *user's*
+      # browser can reach -- not a container name. Tracks BACKEND_PORT unless
+      # you set it explicitly (which you must, for a non-localhost server).
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:${BACKEND_PORT:-19800}}
     depends_on:
       - backend
 
@@ -152,7 +172,9 @@ services:
     image: ollama/ollama:latest
     profiles: ["local"]
     ports:
-      - "11434:11434"
+      # Loopback only: the backend reaches it as http://ollama:11434 over the
+      # compose network, so the host mapping is for debugging only.
+      - "${INFRA_BIND:-127.0.0.1}:${OLLAMA_PORT:-19434}:11434"
     volumes:
       - ollama_data:/root/.ollama
 

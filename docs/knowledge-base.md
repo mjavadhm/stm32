@@ -31,20 +31,24 @@ PageVault migration break this project.
 **So: two stacks, one network, HTTP only.**
 
 ```
-┌─────────────────────────┐         ┌──────────────────────────┐
-│ stm32-ai-assistant      │         │ pagevault                │
-│  backend  :8000         │         │  api        :8100 → 8000 │
-│  worker                 │ ──────▶ │  textrag-worker          │
-│  postgres redis qdrant  │ rag-net │  embeddings :7997        │
-│  frontend :3000         │  HTTP   │  postgres redis qdrant   │
-└─────────────────────────┘         └──────────────────────────┘
+┌──────────────────────────┐         ┌───────────────────────────┐
+│ stm32-ai-assistant       │         │ pagevault                 │
+│  backend  :19800 → 8000  │         │  api      :19100 → 8000   │
+│  worker                  │ ──────▶ │  textrag-worker           │
+│  postgres redis qdrant   │ rag-net │  embeddings :7997         │
+│  frontend :19300 → 3000  │  HTTP   │  postgres redis qdrant    │
+└──────────────────────────┘         └───────────────────────────┘
 ```
+
+Only the host side moved to 19xxx (see the "Host ports" block in
+`.env.example`). Container-internal ports are untouched, so `PAGEVAULT_URL`
+stays `http://pagevault-api:8000` regardless of what the host publishes.
 
 ## Running both
 
 ```bash
-docker network create rag-net     # once, ever
-
+./run.sh                          # creates rag-net, starts PageVault, then this stack
+# or, by hand:
 make up-all                       # knowledge base, then this project
 # or: make up-all PAGEVAULT_DIR=/path/to/pagevault
 ```
@@ -53,11 +57,16 @@ make up-all                       # knowledge base, then this project
 adds the network, the `pagevault-api` alias and a host port remap, so the
 PageVault repo itself is never modified and still runs standalone.
 
+Because that first `-f` points into the PageVault checkout, Compose treats *that*
+directory as the project directory and reads *its* `.env` — not ours. So
+`PAGEVAULT_PORT` has to reach it through the environment; both the Makefile and
+`run.sh` export it for exactly that reason.
+
 Verify the link:
 
 ```bash
 make kb-check
-curl localhost:8000/rag/health
+curl localhost:19800/rag/health
 ```
 
 ## Using it from an agent
@@ -87,10 +96,10 @@ agent should copy from it:
 Try it without any pipeline:
 
 ```bash
-curl -X POST localhost:8000/rag/search -H 'content-type: application/json' \
+curl -X POST localhost:19800/rag/search -H 'content-type: application/json' \
   -d '{"query": "DMA registers on STM32F407"}'
 
-curl -X POST localhost:8000/rag/ask -H 'content-type: application/json' \
+curl -X POST localhost:19800/rag/ask -H 'content-type: application/json' \
   -d '{"question": "How do I use HAL_SPI_Transmit with DMA on STM32F407?"}'
 ```
 

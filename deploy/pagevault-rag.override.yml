@@ -34,6 +34,7 @@ services:
           # other api-named container on the shared network.
           - pagevault-api
     ports:
-      # Remapped: the STM32 backend already owns host port 8000. Inside the
-      # network the port is still 8000, so PAGEVAULT_URL never changes.
-      - "8100:8000"
+      # Remapped: PageVault's own compose publishes this on host 8000, which is
+      # a busy port. Inside the network it is still 8000, so PAGEVAULT_URL
+      # (http://pagevault-api:8000) never changes. Override with PAGEVAULT_PORT.
+      - "${PAGEVAULT_PORT:-19100}:8000"

@@ -18,18 +18,56 @@
 ## راه‌اندازی سریع
 
 ```bash
-# 1) ساخت فایل env
+# 1) ساخت فایل env و گذاشتن LLM_API_KEY در آن
 cp .env.example .env
-# مقدار LLM_API_KEY را در .env بگذارید
 
-# 2) بالا آوردن همه سرویس‌ها
-docker compose up -d --build
-
-# 3) بررسی سلامت
-curl http://localhost:8000/health        # سلامت بک‌اند
-curl http://localhost:8000/health/llm    # تست اتصال به LLM Provider (معیار پذیرش M0)
-# فرانت‌اند: http://localhost:3000
+# 2) یک دستور، همین
+./run.sh
 ```
+
+`run.sh` تکرارپذیر (idempotent) است — هم اجرای اول و هم هر بار بعدی. چهار کاری که
+`docker compose up` تنهایی انجام نمی‌دهد و تا امروز باید با خطا خوردن کشفشان می‌کردید:
+
+1. شبکه‌ی external به نام `rag-net` را می‌سازد؛ بدون آن compose از همان ثانیه‌ی اول fail می‌کند.
+2. ایمیج toolchain را **قبل از** بقیه می‌سازد، چون `backend` به healthy شدنش وابسته است.
+   حدود ۱ گیگابایت، تنها مرحله‌ای که به اینترنت نیاز دارد، و در اجرای اول ۱۰ تا ۲۵ دقیقه.
+3. جدول‌های پین وندور را import می‌کند (`build_devices`) — بی آن، اعتبارسنجی پین و AF
+   هیچ داده‌ای برای مقایسه ندارد.
+4. دو تنظیمی را که با جابه‌جا شدن پورت‌ها بی‌صدا UI را می‌شکنند چک می‌کند:
+   `NEXT_PUBLIC_API_URL` و `CORS_ORIGINS`.
+
+```bash
+./run.sh --no-kb     # بدون پایگاه دانش PageVault
+./run.sh --status    # چه چیزی بالاست و روی چه آدرسی
+./run.sh --down      # خواباندن این استک
+```
+
+### آدرس‌ها
+
+| سرویس | آدرس |
+|---|---|
+| داشبورد و چت | <http://localhost:19300> |
+| API بک‌اند | <http://localhost:19800> |
+| PageVault API | <http://localhost:19100> |
+
+```bash
+curl http://localhost:19800/health        # سلامت بک‌اند
+curl http://localhost:19800/health/llm    # تست اتصال به LLM Provider (معیار پذیرش M0)
+```
+
+پورت‌های میزبان عمداً در بازه‌ی ۱۹xxx هستند: IANA این بازه را به چیزی اختصاص نداده و
+لینوکس پورت‌های ephemeral را از ۳۲۷۶۸ به بالا برمی‌دارد، پس با Postgres یا Redis‌ای که
+از قبل روی سرور بالاست تصادم نمی‌کنند. پورت‌های **داخلی** کانتینرها دست‌نخورده‌اند، یعنی
+`DATABASE_URL` و `REDIS_URL` و `PAGEVAULT_URL` هیچ‌وقت عوض نمی‌شوند. برای جابه‌جا کردن
+پورت‌ها بلوک «Host ports» در `.env.example` را ببینید.
+
+Postgres و Redis و Qdrant فقط روی loopback باز می‌شوند، چون `POSTGRES_PASSWORD` به‌طور
+پیش‌فرض `stm32ai` است. اگر واقعاً به دسترسی از بیرون نیاز داشتید، **اول رمز را عوض کنید**
+و بعد `INFRA_BIND=0.0.0.0` بگذارید.
+
+> اگر UI را از مرورگری غیر از همین ماشین باز می‌کنید، `NEXT_PUBLIC_API_URL` باید آدرسی
+> باشد که **مرورگر کاربر** می‌بیند (نه `localhost` و نه نام کانتینر)، و `CORS_ORIGINS`
+> هم باید همان مبدأ را داشته باشد. `run.sh` هر دو را چک می‌کند و هشدار می‌دهد.
 
 ### اجرای لوکال بدون Docker (برای توسعه)
 
@@ -39,7 +77,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload
 
-cd frontend
+cd ../frontend
 npm install && npm run dev
 ```
 
@@ -66,23 +104,25 @@ docker compose --profile local up -d ollama
 بازیابی در این ریپو پیاده‌سازی نشده؛ توسط **PageVault** انجام می‌شود — یک سرویس اپن‌سورس مستقل که در استک داکر خودش بالا می‌آید و از طریق HTTP روی شبکهٔ مشترک `rag-net` صدا زده می‌شود.
 
 ```bash
-docker network create rag-net     # یک‌بار برای همیشه
-make up-all                       # اول پایگاه دانش، بعد این پروژه
-# یا: make up-all PAGEVAULT_DIR=/path/to/pagevault
+./run.sh                          # خودش rag-net را می‌سازد و PageVault را هم بالا می‌آورد
+# یا دستی: make up-all PAGEVAULT_DIR=/path/to/pagevault
 
 make kb-check                     # آیا از داخل بک‌اند در دسترس است؟
-curl localhost:8000/rag/health
+curl localhost:19800/rag/health
 ```
+
+اگر `../pagevault` وجود نداشته باشد، `run.sh` هشدار می‌دهد و ادامه می‌دهد: چت و RAG کار
+می‌کنند ولی پاسخ‌ها بدون ارجاع و «unverified» هستند.
 
 تست بدون اجرای پایپ‌لاین:
 
 ```bash
 # فقط بازیابی، بدون LLM — برای تشخیص اینکه مشکل از recall است یا از تولید
-curl -X POST localhost:8000/rag/search -H 'content-type: application/json' \
+curl -X POST localhost:19800/rag/search -H 'content-type: application/json' \
   -d '{"query": "DMA registers on STM32F407"}'
 
 # Datasheet Agent: بازیابی + پاسخ همراه با ارجاع
-curl -X POST localhost:8000/rag/ask -H 'content-type: application/json' \
+curl -X POST localhost:19800/rag/ask -H 'content-type: application/json' \
   -d '{"question": "How do I use HAL_SPI_Transmit with DMA on STM32F407?"}'
 ```
 

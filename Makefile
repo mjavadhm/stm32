@@ -6,6 +6,24 @@ PAGEVAULT_COMPOSE = docker compose \
 	-f $(PAGEVAULT_DIR)/docker-compose.textrag.yml \
 	-f $(CURDIR)/deploy/pagevault-rag.override.yml
 
+# Host ports, read from .env so `make` and `./run.sh` always agree. Defaults
+# must match the ones in docker-compose.yml.
+dotenv = $(shell sed -n 's/^[[:space:]]*$(1)[[:space:]]*=//p' $(CURDIR)/.env 2>/dev/null | tail -n1)
+FRONTEND_PORT  ?= $(or $(call dotenv,FRONTEND_PORT),19300)
+BACKEND_PORT   ?= $(or $(call dotenv,BACKEND_PORT),19800)
+PAGEVAULT_PORT ?= $(or $(call dotenv,PAGEVAULT_PORT),19100)
+
+# The PageVault stack is loaded with `-f $(PAGEVAULT_DIR)/...`, which makes that
+# directory compose's project directory -- so it reads PageVault's .env and not
+# ours. Exporting is what carries our port across.
+export PAGEVAULT_PORT
+
+# Guided first run: creates rag-net, builds the toolchain image before the
+# backend needs it, imports the pin tables, and checks the settings that break
+# silently when ports move. Idempotent -- safe as the everyday "start" command.
+start:
+	./run.sh
+
 up:
 	docker compose up -d --build
 
@@ -24,9 +42,9 @@ kb-logs:
 
 # Both stacks, knowledge base first.
 up-all: net kb-up up
-	@echo "STM32 API      http://localhost:8000"
-	@echo "Dashboard      http://localhost:3000"
-	@echo "PageVault API  http://localhost:8100"
+	@echo "STM32 API      http://localhost:$(BACKEND_PORT)"
+	@echo "Dashboard      http://localhost:$(FRONTEND_PORT)"
+	@echo "PageVault API  http://localhost:$(PAGEVAULT_PORT)"
 
 down-all: down kb-down
 
@@ -113,4 +131,4 @@ lint:
 devices:
 	docker compose exec backend python -m scripts.build_devices
 
-.PHONY: up down logs ollama-up test lint net kb-up kb-down kb-logs up-all down-all kb-check kb-probe eval builder-image golden scaffold sdk-check sdk-refresh devices board
+.PHONY: start up down logs ollama-up test lint net kb-up kb-down kb-logs up-all down-all kb-check kb-probe eval builder-image golden scaffold sdk-check sdk-refresh devices board

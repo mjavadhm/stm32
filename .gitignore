@@ -14,8 +14,11 @@ out/
 npm-debug.log*
 
 # Env & secrets
+# Catch-all, so a .env.bak / .env.prod / .env.save can never be committed by
+# accident. The example file is the one deliberate exception.
 .env
-.env.local
+.env.*
+!.env.example
 *.key
 
 # IDE / OS
