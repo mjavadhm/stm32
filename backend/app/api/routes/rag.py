@@ -7,7 +7,7 @@ chat UI's scope selectors ("ask against this collection, or only this
 document").
 """
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 from app.agents.datasheet import answer_hardware_question, detect_family
@@ -117,6 +117,85 @@ async def rag_collections() -> dict:
         "visual": visual,
         "warnings": warnings,
     }
+
+
+@router.get("/source")
+async def rag_source(
+    citation: str = Query(min_length=1, description="path:line_start-line_end"),
+    collection: str | None = None,
+) -> dict:
+    """The source text behind a citation, so an answer can be checked.
+
+    A citation is `path:start-end` (or a bare path). The document is found
+    by path in the collection, then the chunks overlapping that line range
+    are returned -- that is exactly the excerpt the model was shown.
+    """
+    path, _, lines = citation.rpartition(":")
+    start = end = 0
+    if path and "-" in lines:
+        first, _, last = lines.partition("-")
+        if first.isdigit() and last.isdigit():
+            start, end = int(first), int(last)
+    if not start:
+        # No parsable line range: treat the whole citation as a path.
+        path, start, end = citation, 0, 0
+
+    rag = get_rag_client()
+    target = collection or settings.rag_text_collection
+    documents, warning = await rag.list_documents(target)
+    if warning:
+        raise HTTPException(status_code=503, detail=warning)
+
+    document = next((d for d in documents if d.get("path") == path), None)
+    if document is None:
+        raise HTTPException(
+            status_code=404, detail=f"no indexed document with path {path!r}"
+        )
+
+    chunks, warning = await rag.get_document_chunks(document["id"])
+    if warning:
+        raise HTTPException(status_code=503, detail=warning)
+
+    def overlaps(chunk: dict) -> bool:
+        chunk_lines = chunk.get("lines") or [0, 0]
+        if not start:
+            return True
+        return not (chunk_lines[1] < start or chunk_lines[0] > end)
+
+    matched = [c for c in chunks if overlaps(c)]
+    return {
+        "citation": citation,
+        "collection": target,
+        "document_id": document["id"],
+        "path": path,
+        "lines": [start, end] if start else None,
+        "chunks": [
+            {
+                "name": c.get("name", ""),
+                "kind": c.get("kind", ""),
+                "lines": c.get("lines"),
+                "text": c.get("text", ""),
+            }
+            for c in matched
+        ],
+    }
+
+
+@router.get("/page")
+async def rag_page(
+    document_id: str = Query(min_length=1), page: int = Query(ge=1)
+) -> Response:
+    """Proxy one indexed PDF page image (the browser cannot reach PageVault)."""
+    content, media_type, warning = await get_rag_client().fetch_page_image(
+        document_id, page
+    )
+    if content is None:
+        raise HTTPException(status_code=503, detail=warning or "page unavailable")
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
 
 
 @router.get("/documents")

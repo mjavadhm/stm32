@@ -519,6 +519,48 @@ class PageVaultClient:
                 out.append(_snippet_from_symbol(results[0], channel="type"))
         return out, None, False
 
+    async def get_document_chunks(
+        self, document_id: str
+    ) -> tuple[list[dict], str | None]:
+        """Every indexed chunk of one document, in file order.
+
+        Used to show a citation's actual source text: a citation carries a
+        path and a line range, and the chunk covering that range is the
+        excerpt the model was shown.
+        """
+        try:
+            response = await self._client.get(
+                f"/text/documents/{document_id}/chunks"
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:
+            logger.warning("fetching chunks of %s failed: %s", document_id, exc)
+            return [], self._channel_error("source", exc)
+        return list(data.get("chunks", [])), None
+
+    async def fetch_page_image(
+        self, document_id: str, page: int
+    ) -> tuple[bytes | None, str, str | None]:
+        """One indexed PDF page as an image, proxied.
+
+        The browser cannot reach PageVault directly (own stack, own port, no
+        CORS), so page images travel through this backend instead.
+        """
+        try:
+            response = await self._client.get(
+                f"/files/{document_id}/pages/{page}.png"
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            logger.warning("fetching page image failed: %s", exc)
+            return None, "", self._channel_error("page image", exc)
+        return (
+            response.content,
+            response.headers.get("content-type", "image/png"),
+            None,
+        )
+
     # ------------------------------------------------------------------
     # Knowledge-base browsing: what can the user choose to ask against?
     # These power the collection/document selectors in the chat UI.

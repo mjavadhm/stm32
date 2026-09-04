@@ -280,6 +280,66 @@ def test_collections_and_documents_can_be_listed():
     assert pages == [{"id": "p1", "path": "RM0090.pdf", "status": "indexed", "pages": 1130}]
 
 
+def test_document_chunks_can_be_fetched_for_a_citation():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/text/documents/d1/chunks":
+            return httpx.Response(
+                200,
+                json={
+                    "document_id": "d1",
+                    "path": "hal/Src/spi.c",
+                    "count": 2,
+                    "chunks": [
+                        {
+                            "id": "c1",
+                            "kind": "function",
+                            "name": "HAL_SPI_Receive_DMA",
+                            "lines": [1745, 1853],
+                            "text": "HAL_StatusTypeDef HAL_SPI_Receive_DMA(...)",
+                        },
+                        {
+                            "id": "c2",
+                            "kind": "function",
+                            "name": "HAL_SPI_Transmit_DMA",
+                            "lines": [1643, 1743],
+                            "text": "HAL_StatusTypeDef HAL_SPI_Transmit_DMA(...)",
+                        },
+                    ],
+                },
+            )
+        return httpx.Response(404, text="unknown route")
+
+    chunks, warning = asyncio.run(_client(handler).get_document_chunks("d1"))
+
+    assert warning is None
+    assert [c["name"] for c in chunks] == [
+        "HAL_SPI_Receive_DMA",
+        "HAL_SPI_Transmit_DMA",
+    ]
+
+
+def test_page_images_are_proxied():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/files/p1/pages/3.png":
+            return httpx.Response(
+                200, content=b"\x89PNG-bytes", headers={"content-type": "image/png"}
+            )
+        return httpx.Response(404, text="unknown route")
+
+    content, media_type, warning = asyncio.run(
+        _client(handler).fetch_page_image("p1", 3)
+    )
+
+    assert warning is None
+    assert content == b"\x89PNG-bytes"
+    assert media_type == "image/png"
+
+    missing, _type, warning = asyncio.run(
+        _client(handler).fetch_page_image("nope", 1)
+    )
+    assert missing is None and warning
+
+
 def test_listings_degrade_to_empty_when_pagevault_is_down():
     def boom(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("refused", request=request)
