@@ -42,6 +42,19 @@ cp .env.example .env
 ./run.sh --down      # خواباندن این استک
 ```
 
+برای اجرای یک نسخه‌ی آزمایشی در کنار نسخه‌ی دیگری که از قبل در Docker بالاست،
+برای هر دو استک نام و پورت جدا بگذارید:
+
+```bash
+COMPOSE_PROJECT_NAME=stm32-laptop-test ./run.sh
+```
+
+در این حالت `run.sh` برای PageVault هم به‌طور خودکار نام
+`stm32-laptop-test-pagevault` را انتخاب می‌کند و کانتینرهای PageVault قبلی را
+استفاده یا recreate نمی‌کند. پورت‌های نسخه‌ی آزمایشی هم باید جدا باشند؛ مثلاً
+در `.env` آن نسخه `FRONTEND_PORT=20300`، `BACKEND_PORT=20800` و
+`PAGEVAULT_PORT=20100` بگذارید.
+
 ### آدرس‌ها
 
 | سرویس | آدرس |

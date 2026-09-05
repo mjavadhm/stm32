@@ -89,10 +89,25 @@ QDRANT_PORT=$(env_get QDRANT_PORT 19333)
 QDRANT_GRPC_PORT=$(env_get QDRANT_GRPC_PORT 19334)
 PAGEVAULT_DIR=$(env_get PAGEVAULT_DIR ../pagevault)
 
+# A second STM32 checkout needs a second PageVault Compose project too. Without
+# this explicit name, Compose derives `pagevault` from the checkout directory
+# and the test run silently reuses the original PageVault containers. Preserve
+# the historic name for the normal installation, but namespace PageVault when
+# COMPOSE_PROJECT_NAME was supplied for an isolated test installation.
+MAIN_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-$(env_get COMPOSE_PROJECT_NAME)}
+if [[ -n ${PAGEVAULT_PROJECT_NAME:-} ]]; then
+  PAGEVAULT_PROJECT_NAME=$PAGEVAULT_PROJECT_NAME
+elif [[ -n $MAIN_PROJECT_NAME ]]; then
+  PAGEVAULT_PROJECT_NAME="${MAIN_PROJECT_NAME}-pagevault"
+else
+  PAGEVAULT_PROJECT_NAME=pagevault
+fi
+
 # The PageVault stack is invoked with `-f ../pagevault/...`, which makes that
 # directory compose's project directory -- so it reads PageVault's .env, not
 # ours. Exporting is the only way our value reaches it.
 export PAGEVAULT_PORT
+export PAGEVAULT_PROJECT_NAME
 
 case $ACTION in
   down)
@@ -192,6 +207,7 @@ if ((WITH_KB == 0)); then
   info "skipped (--no-kb)"
 elif [[ -d $PAGEVAULT_DIR && -f $PAGEVAULT_DIR/docker-compose.yml ]]; then
   if docker compose \
+      -p "$PAGEVAULT_PROJECT_NAME" \
       -f "$PAGEVAULT_DIR/docker-compose.yml" \
       -f "$PAGEVAULT_DIR/docker-compose.textrag.yml" \
       -f "$PWD/deploy/pagevault-rag.override.yml" \
