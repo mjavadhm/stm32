@@ -176,6 +176,32 @@ fi
 [[ $(env_get REDIS_URL) == *stm32-redis* ]] ||
   warn "REDIS_URL does not use the stm32-redis alias. On rag-net the bare name \`redis\` is PageVault's, and the worker will steal its tasks."
 
+# PageVault .env check (when knowledge base is enabled)
+if ((WITH_KB == 1)) && [[ -d $PAGEVAULT_DIR && -f $PAGEVAULT_DIR/docker-compose.yml ]]; then
+  pv_env="$PAGEVAULT_DIR/.env"
+  if [[ ! -f $pv_env ]]; then
+    [[ -f $PAGEVAULT_DIR/.env.example ]] || die "PageVault at ${PAGEVAULT_DIR} has no .env and no .env.example."
+    cp "$PAGEVAULT_DIR/.env.example" "$pv_env"
+    if [[ -f $PAGEVAULT_DIR/.env.textrag.example ]]; then
+      cat "$PAGEVAULT_DIR/.env.textrag.example" >> "$pv_env"
+    fi
+    printf '\n%s created %s from .env.example and .env.textrag.example.%s\n\n' "$BLD" "$pv_env" "$OFF"
+    info "Review PageVault settings in ${pv_env}, then run ./run.sh again."
+    exit 1
+  fi
+  if [[ -f $PAGEVAULT_DIR/docker-compose.textrag.yml ]] && ! grep -q "TEXTRAG_" "$pv_env"; then
+    if [[ -f $PAGEVAULT_DIR/.env.textrag.example ]]; then
+      cat "$PAGEVAULT_DIR/.env.textrag.example" >> "$pv_env"
+      printf '\n%s appended .env.textrag.example to %s.%s\n\n' "$BLD" "$pv_env" "$OFF"
+      info "Review PageVault settings in ${pv_env}, then run ./run.sh again."
+      exit 1
+    else
+      die "${pv_env} is missing TEXTRAG_* settings required by docker-compose.textrag.yml."
+    fi
+  fi
+  ok "PageVault .env is present"
+fi
+
 # ---------------------------------------------------------------- port scan
 # Only meaningful before the stack exists; once it is up these are held by our
 # own containers.
@@ -215,7 +241,7 @@ elif [[ -d $PAGEVAULT_DIR && -f $PAGEVAULT_DIR/docker-compose.yml ]]; then
     KB_UP=1
     ok "PageVault is up on port ${PAGEVAULT_PORT}"
   else
-    warn "PageVault failed to start. Continuing -- retrieval degrades to ungrounded answers."
+    die "PageVault failed to start. Fix the error above, or run with --no-kb to start without knowledge base."
   fi
 else
   warn "no PageVault checkout at ${PAGEVAULT_DIR}, so there is no knowledge base."
