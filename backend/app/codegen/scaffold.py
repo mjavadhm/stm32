@@ -131,6 +131,7 @@ def scaffold_project(
     clean: bool = True,
     target: str = "",
     summary: str = "",
+    extra_sources: list[str] | None = None,
 ) -> Scaffold:
     """Generate the whole project skeleton into the project's workspace."""
     device = device_for(plan.mcu)
@@ -166,10 +167,27 @@ def scaffold_project(
     conf_text, conf_warnings = _hal_conf(copy.modules, plan)
     result.warnings.extend(conf_warnings)
 
+    user_sources: list[str] = []
+    if extra_sources is not None:
+        user_sources = [s for s in extra_sources if s.endswith(".c")]
+    elif workspace.exists(project_id):
+        base = workspace.workspace_path(project_id)
+        src_dir = base / "Core" / "Src"
+        if src_dir.is_dir():
+            for p in sorted(src_dir.glob("*.c")):
+                rel = str(p.relative_to(base))
+                if rel not in (
+                    "Core/Src/main.c",
+                    "Core/Src/stm32f4xx_it.c",
+                    "Core/Src/stm32f4xx_hal_msp.c",
+                ):
+                    user_sources.append(rel)
+
     c_sources = [
         "Core/Src/main.c",
         "Core/Src/stm32f4xx_it.c",
         "Core/Src/stm32f4xx_hal_msp.c",
+        *user_sources,
         *[path for path in copy.sources if path.endswith(".c")],
     ]
     asm_sources = [path for path in copy.sources if path.endswith(".s")]

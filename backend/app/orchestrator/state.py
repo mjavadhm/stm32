@@ -21,12 +21,14 @@ class PipelineState(TypedDict, total=False):
     request_type: str
     routing: dict[str, Any]
 
-    # --- design agents (M3), each a serialised contract ---
+    # --- design and codegen agents (M3/M4), each a serialised contract ---
     requirements: dict[str, Any]
     hardware: dict[str, Any]
     architecture: dict[str, Any]
     cubemx: dict[str, Any]
     cubemx_artifacts: dict[str, Any]
+    firmware: dict[str, Any]
+    firmware_artifacts: dict[str, Any]
 
     # --- copilot path (still mocked until M5) ---
     copilot_result: str

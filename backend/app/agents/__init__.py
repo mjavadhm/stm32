@@ -27,3 +27,11 @@ KNOWN_AGENTS: list[str] = [
     "test",
     "docs",
 ]
+
+from app.agents.firmware import firmware_node, generate_firmware  # noqa: E402
+
+__all__ = [
+    "KNOWN_AGENTS",
+    "firmware_node",
+    "generate_firmware",
+]
