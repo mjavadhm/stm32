@@ -36,6 +36,22 @@ def run_pipeline(project_id: str) -> str:
     return asyncio.run(_run_pipeline_and_cleanup(project_id))
 
 
+@celery_app.task(name="rebuild_project")
+def rebuild_project(project_id: str, attempt: int) -> str:
+    """Manual `POST /projects/{id}/build`: compile the workspace as it is now."""
+    return asyncio.run(_rebuild_and_cleanup(project_id, attempt))
+
+
+async def _rebuild_and_cleanup(project_id: str, attempt: int) -> str:
+    from app.build.client import close_builder_client
+    from app.build.rebuild import rebuild
+
+    try:
+        return await rebuild(project_id, attempt)
+    finally:
+        await close_builder_client()
+
+
 async def _run_pipeline_and_cleanup(project_id: str) -> str:
     """Run the pipeline, then dispose every async client this loop created.
 
