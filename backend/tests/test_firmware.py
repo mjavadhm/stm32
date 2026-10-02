@@ -17,8 +17,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.agents.firmware import (
+    _header_signatures,
     _headers_context,
     _merge_scaffold_file,
+    _scaffold_fallback,
     firmware_node,
     generate_firmware,
 )
@@ -365,3 +367,118 @@ def test_firmware_node_returns_state_update():
     assert "firmware_artifacts" in update
     assert update["firmware_artifacts"]["file_count"] == 1
     assert update["firmware_artifacts"]["files"] == ["Core/Src/main.c"]
+
+
+def test_header_signatures_keep_interface_and_drop_noise():
+    header = (
+        "#ifndef SENSOR_H\n"
+        "#define SENSOR_H\n"
+        '#include "main.h"\n'
+        "/* a block comment */\n"
+        "#define SENSOR_ADDR 0x68\n"
+        "typedef struct {\n"
+        "  uint8_t id;\n"
+        "  uint16_t rate;\n"
+        "} Sensor_t;\n"
+        "// read one sample\n"
+        "int Sensor_Read(Sensor_t *s);\n"
+        "static inline int Sensor_Ready(Sensor_t *s) { return s->id != 0; }\n"
+        "#endif\n"
+    )
+    sig = _header_signatures(header)
+
+    # Interface is kept.
+    assert "#define SENSOR_ADDR 0x68" in sig
+    assert "int Sensor_Read(Sensor_t *s);" in sig
+    assert "Sensor_t" in sig and "uint16_t rate" in sig  # struct body preserved
+    assert "int Sensor_Ready(Sensor_t *s);" in sig  # def reduced to a signature
+    # Noise is dropped.
+    assert "SENSOR_H" not in sig  # include guard
+    assert "#include" not in sig
+    assert "block comment" not in sig
+    assert "read one sample" not in sig
+    assert "return s->id" not in sig  # inline body dropped
+
+
+def test_scaffold_fallback_uses_valid_hal_handle_types():
+    # SPI1 -> SPI_HandleTypeDef (not SPI1_HandleTypeDef), as a definition.
+    main_c = _scaffold_fallback("Core/Src/main.c", _sample_cubemx_plan())
+    assert "SPI_HandleTypeDef hspi1;" in main_c
+    assert "SPI1_HandleTypeDef" not in main_c
+    assert "extern SPI_HandleTypeDef hspi1;" not in main_c
+
+    # USART2 -> UART_HandleTypeDef huart2; (family folds USART into UART).
+    uart_plan = CubeMXPlan(
+        mcu="STM32F407VGTx",
+        peripherals=[PeripheralConfig(peripheral="USART2", mode="async")],
+    )
+    uart_main = _scaffold_fallback("Core/Src/main.c", uart_plan)
+    assert "UART_HandleTypeDef huart2;" in uart_main
+    assert "USART2_HandleTypeDef" not in uart_main
+    assert "USART_HandleTypeDef" not in uart_main
+
+
+def test_undocumented_hal_api_is_recorded_as_assumption():
+    arch = Architecture(
+        overview="single driver",
+        driver_layer="hal",
+        implementation_order=[
+            ImplementationStep(order=1, title="Sensor", files=["Core/Src/sensor.c"])
+        ],
+    )
+    llm = ScriptedLLM(
+        {
+            "path": "Core/Src/sensor.c",
+            "contents": (
+                '#include "main.h"\n'
+                "void Sensor_Reset(void) {\n"
+                "  HAL_GPIO_TogglePin(GPIOD, GPIO_PIN_13);\n"  # plumbing, allowed
+                "  HAL_SPI_Abort_IT(&hspi1);\n"  # not in any evidence
+                "}\n"
+            ),
+            "citations": [],
+        }
+    )
+
+    bundle, _warnings = asyncio.run(
+        generate_firmware(
+            _sample_requirements(),
+            _sample_hardware(),
+            arch,
+            _sample_cubemx_plan(),
+            llm=llm,
+        )
+    )
+
+    joined = " ".join(bundle.assumptions)
+    assert "HAL_SPI_Abort_IT" in joined
+    assert "HAL_GPIO_TogglePin" not in joined  # allowlisted plumbing, not flagged
+
+
+def test_duplicate_file_across_steps_is_deduped():
+    arch = Architecture(
+        overview="same path twice",
+        driver_layer="hal",
+        implementation_order=[
+            ImplementationStep(order=1, title="First", files=["Core/Src/app.c"]),
+            ImplementationStep(order=2, title="Second", files=["Core/Src/app.c"]),
+        ],
+    )
+    llm = ScriptedLLM(
+        {"path": "Core/Src/app.c", "contents": "/* v1 */\nvoid App(void) {}\n"},
+        {"path": "Core/Src/app.c", "contents": "/* v2 */\nvoid App(void) {}\n"},
+    )
+
+    bundle, warnings = asyncio.run(
+        generate_firmware(
+            _sample_requirements(),
+            _sample_hardware(),
+            arch,
+            _sample_cubemx_plan(),
+            llm=llm,
+        )
+    )
+
+    assert [f.path for f in bundle.files] == ["Core/Src/app.c"]  # one entry only
+    assert "/* v2 */" in bundle.file("Core/Src/app.c").contents  # last write wins
+    assert any("more than one step" in w for w in warnings)

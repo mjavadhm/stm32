@@ -14,14 +14,17 @@ Key rules:
 """
 
 import logging
+import re
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from app.agents.base import request_contract
 from app.build import workspace
+from app.codegen.peripherals import HANDLE_TYPES
 from app.codegen.render import merge_user_code, render, user_regions
 from app.codegen.scaffold import scaffold_project
+from app.codegen.sdk import family
 from app.core.llm import get_agent_llm, is_agent_enabled
 from app.orchestrator.contracts import (
     Architecture,
@@ -44,6 +47,43 @@ AGENT_NAME = "firmware"
 # than withheld: code without a documented basis must be detectable, not banned
 # (docs/m4-plan.md, P4).
 _LOW_COVERAGE = 0.5
+
+# HAL calls the deterministic scaffold and MSP layer always emit: clock, GPIO,
+# NVIC, power and flash plumbing, plus the handful of core entry points. The
+# application may lean on these without a datasheet citation, so they never
+# count as an undocumented assumption (P4, docs/m4-plan.md:160-181).
+_ALWAYS_AVAILABLE_APIS = frozenset(
+    {
+        "HAL_Init",
+        "HAL_DeInit",
+        "HAL_Delay",
+        "HAL_GetTick",
+        "HAL_IncTick",
+        "HAL_GetUID",
+        "HAL_NVIC_SystemReset",
+    }
+)
+_ALWAYS_AVAILABLE_PREFIXES = (
+    "HAL_GPIO_",
+    "HAL_RCC_",
+    "__HAL_RCC_",
+    "HAL_NVIC_",
+    "HAL_PWR",
+    "__HAL_PWR",
+    "__HAL_FLASH",
+    "HAL_FLASH_",
+    "HAL_SYSTICK_",
+)
+# Matches HAL functions (`HAL_SPI_Transmit`) and the double-underscore HAL
+# macros (`__HAL_RCC_...`) alike -- 0, 1 or 2 leading underscores. Plain HAL_
+# calls are the whole point of the check, so the underscores must be optional.
+_HAL_CALL_RE = re.compile(r"\b_{0,2}HAL_[A-Za-z0-9_]+")
+# How many undocumented APIs to name before the note just says "and N more".
+_MAX_LISTED_APIS = 8
+
+_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
+_DEFINE_RE = re.compile(r"#\s*define\s+(?P<name>\w+(?:\([^)]*\))?)\s+(?P<body>\S.*)$")
 
 _SYSTEM_PROMPT = """You are an expert embedded firmware engineer writing C for STM32.
 
@@ -128,14 +168,127 @@ def _step_evidence(step: ImplementationStep, hardware: HardwareFindings) -> str:
     return "\n".join(lines) if lines else "None available for this step."
 
 
+def _collapse_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _next_significant(code: str, start: int) -> str:
+    """The first `;` or `{` at or after `start`, or "" if neither appears.
+
+    Used to tell a closed struct/typedef body (`} Name;` -- more to come before
+    the `;`) from a function body with no trailing `;` (the next token opens a
+    new block, or the input ends).
+    """
+    for ch in code[start:]:
+        if ch == ";":
+            return ";"
+        if ch == "{":
+            return "{"
+    return ""
+
+
+def _split_declarations(code: str) -> list[str]:
+    """Top-level, brace-aware `;`-terminated statements from C source.
+
+    Prototypes and typedef/struct/enum bodies come back whole; a stray function
+    *definition* is reduced to its signature so a header's inline body is not
+    dragged into the next step's prompt.
+    """
+    out: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    i = 0
+    n = len(code)
+    while i < n:
+        ch = code[i]
+        buf.append(ch)
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth = max(0, depth - 1)
+            if depth == 0 and _next_significant(code, i + 1) != ";":
+                head = _collapse_ws("".join(buf).split("{", 1)[0])
+                if head:
+                    out.append(f"{head};")
+                buf = []
+        elif ch == ";" and depth == 0:
+            statement = _collapse_ws("".join(buf))
+            if statement and statement != ";":
+                out.append(statement)
+            buf = []
+        i += 1
+    tail = _collapse_ws("".join(buf))
+    if tail and tail != ";":
+        out.append(tail if tail.endswith(";") else f"{tail};")
+    return out
+
+
+def _header_signatures(contents: str) -> str:
+    """Reduce a header to its interface: value macros and declarations.
+
+    The P4 token budget wants later steps to see *what a header offers*, not
+    every line of it. Comments, include guards and `#include` lines carry no
+    interface, so they are dropped; object/function-like macros with a value
+    and every top-level declaration are kept. Falls back to the stripped body
+    if nothing recognisable is found, so an unusual header is never blanked.
+    """
+    text = _BLOCK_COMMENT_RE.sub("", contents)
+    text = _LINE_COMMENT_RE.sub("", text)
+
+    macros: list[str] = []
+    code_lines: list[str] = []
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            match = _DEFINE_RE.match(stripped)
+            if match:
+                macros.append(f"#define {match.group('name')} {match.group('body').strip()}")
+            # Include guards, #include and #if/#endif carry no interface.
+            continue
+        code_lines.append(raw)
+
+    kept = macros + _split_declarations("\n".join(code_lines))
+    if kept:
+        return "\n".join(kept)
+    collapsed = _collapse_ws(text)
+    return collapsed or contents.strip()
+
+
+def _undocumented_apis(contents: str, support: str) -> list[str]:
+    """HAL calls in `contents` with no basis in `support` or the scaffold.
+
+    P4 rule: an API the retrieved evidence does not cover is an assumption, not
+    a citation. Clock/GPIO/NVIC plumbing the deterministic layer always emits is
+    excluded, so the caller's note names only application-level calls that lack
+    a documented basis.
+    """
+    missing: list[str] = []
+    seen: set[str] = set()
+    for symbol in _HAL_CALL_RE.findall(contents):
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        if symbol in _ALWAYS_AVAILABLE_APIS:
+            continue
+        if symbol.startswith(_ALWAYS_AVAILABLE_PREFIXES):
+            continue
+        if symbol in support:
+            continue
+        missing.append(symbol)
+    return missing
+
+
 def _headers_context(generated_files: list[SourceFile]) -> str:
-    """Provide previously generated headers so the model knows available prototypes and types."""
+    """Signatures of previously generated headers, so later steps know the
+    prototypes and types available without spending the whole header on it."""
     headers = [f for f in generated_files if f.path.endswith(".h")]
     if not headers:
         return "No custom headers created yet."
     parts = []
     for h in headers:
-        parts.append(f"=== {h.path} ===\n{h.contents}\n")
+        parts.append(f"=== {h.path} ===\n{_header_signatures(h.contents)}\n")
     return "\n".join(parts)
 
 
@@ -155,10 +308,16 @@ def _matching_module_context(step: ImplementationStep, modules: list[Module]) ->
 def _scaffold_fallback(relative_path: str, plan: CubeMXPlan) -> str:
     """Return a minimal scaffold template if not already present on disk."""
     if relative_path == "Core/Src/main.c":
+        # Definitions, spelled the way the real scaffold spells them: the HAL
+        # type comes from the peripheral family (SPI1 -> SPI_HandleTypeDef,
+        # USART2 -> UART_HandleTypeDef), never SPI1_HandleTypeDef.
         handles = "\n".join(
-            f"extern {p.peripheral}_HandleTypeDef {plan.handle(p.peripheral)};"
+            f"{HANDLE_TYPES[family(p.peripheral)]} {plan.handle(p.peripheral)};"
             for p in plan.peripherals
+            if family(p.peripheral) in HANDLE_TYPES
         )
+        if handles:
+            handles += "\n"
         return render(
             "main.c.tmpl",
             {
@@ -256,6 +415,12 @@ async def generate_firmware(
     generated_files: list[SourceFile] = []
     known_citations = set(hardware.citations)
 
+    # Corpus the undocumented-API check tests each file against: the peripheral
+    # configuration and every finding's answer are the documented basis, so an
+    # application call outside it is flagged as an assumption, not a citation.
+    cubemx_text = _cubemx_context(plan)
+    findings_text = "\n".join(finding.answer for finding in hardware.findings)
+
     steps = architecture.implementation_order
     if not steps:
         warnings.append("No implementation steps in architecture; falling back to file tree.")
@@ -274,6 +439,8 @@ async def generate_firmware(
         step_files = step.files
         if not step_files:
             continue
+
+        evidence_text = _step_evidence(step, hardware)
 
         for file_path in step_files:
             logger.info(
@@ -338,6 +505,28 @@ async def generate_firmware(
             if proposal.assumptions:
                 assumptions.extend(proposal.assumptions)
 
+            support_text = "\n".join(
+                [
+                    cubemx_text,
+                    evidence_text,
+                    scaffold_content,
+                    findings_text,
+                    " ".join(valid_citations),
+                ]
+            )
+            undocumented = _undocumented_apis(final_contents, support_text)
+            if undocumented:
+                listed = undocumented[:_MAX_LISTED_APIS]
+                suffix = (
+                    f" (and {len(undocumented) - _MAX_LISTED_APIS} more)"
+                    if len(undocumented) > _MAX_LISTED_APIS
+                    else ""
+                )
+                assumptions.append(
+                    f"{file_path}: uses HAL APIs with no documented evidence: "
+                    f"{', '.join(listed)}{suffix}"
+                )
+
             source_file = SourceFile(
                 path=file_path,
                 purpose=proposal.purpose or step.title,
@@ -347,6 +536,20 @@ async def generate_firmware(
                 generated=True,
             )
             generated_files.append(source_file)
+
+    # A path that appears in two steps would otherwise land in the bundle twice
+    # -- a misleading file count and a duplicate on disk. Keep the last version
+    # generated for each path and say so, so the collision is visible.
+    if len({f.path for f in generated_files}) != len(generated_files):
+        deduped: dict[str, SourceFile] = {}
+        for source_file in generated_files:
+            if source_file.path in deduped:
+                warnings.append(
+                    f"{source_file.path}: targeted by more than one step; "
+                    "kept the last generated version"
+                )
+            deduped[source_file.path] = source_file
+        generated_files = list(deduped.values())
 
     notes = [f"Generated {len(generated_files)} files across {len(steps)} steps."]
     if hardware.coverage < _LOW_COVERAGE:
