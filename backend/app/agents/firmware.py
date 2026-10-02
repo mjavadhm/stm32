@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 from app.agents.base import request_contract
 from app.agents.repair import repair_firmware
 from app.build import workspace
-from app.codegen.peripherals import HANDLE_TYPES
+from app.codegen.peripherals import HANDLE_TYPES, is_chip_select, pin_label
 from app.codegen.render import merge_user_code, render, user_regions
 from app.codegen.scaffold import scaffold_project
 from app.codegen.sdk import family
@@ -108,10 +108,14 @@ Rules:
    - Include standard guards (`#ifndef ... #define ... #endif`).
    - `#include "main.h"` to access HAL definitions and peripheral handles.
    - Write complete, robust production-ready code with error checking.
-4. Only cite references from allowed citations for this step. If an API usage
+4. Finish the job. Every function you declare is defined, every module is
+   called (main.c: init in USER CODE 2, work in USER CODE WHILE), and there are
+   no placeholders: no "omitted", "TODO", "adjust as needed", no commented-out
+   calls. A project checker rejects all of these after the compile.
+5. Only cite references from allowed citations for this step. If an API usage
    is not covered by retrieved documentation, leave citations empty and note it
    under "assumptions".
-5. Reply with ONLY a JSON object in this format:
+6. Reply with ONLY a JSON object in this format:
 {
   "path": "Core/Src/example.c",
   "purpose": "Brief description of the file",
@@ -155,6 +159,21 @@ def _cubemx_context(plan: CubeMXPlan) -> str:
         for pin in plan.pins:
             sig = pin.signal or pin.peripheral
             lines.append(f"- {pin.pin}: {sig} (mode={pin.mode}, pull={pin.pull})")
+        plain = [
+            pin for pin in plan.pins
+            if pin.signal and not str(pin.mode or "").lower().startswith("alternate")
+        ]
+        if plain:
+            lines.append("\nGPIO names defined in main.h (use these, never a raw port/pin):")
+        for pin in plain:
+            label = pin_label(pin.signal)
+            note = ""
+            if is_chip_select(pin):
+                note = (
+                    " -- chip select, active low, idles high: drive it GPIO_PIN_RESET "
+                    "before a transfer and GPIO_PIN_SET after it"
+                )
+            lines.append(f"- {label}_GPIO_Port / {label}_Pin{note}")
     return "\n".join(lines)
 
 

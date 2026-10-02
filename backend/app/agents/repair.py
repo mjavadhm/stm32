@@ -25,14 +25,17 @@ from pydantic import BaseModel, Field
 
 from app.agents.base import request_contract
 from app.build import workspace
+from app.codegen import checks
 from app.core.config import settings
 from app.core.llm import get_agent_llm, is_agent_enabled
 from app.orchestrator.contracts import (
     BUILD_FAILED,
+    BUILD_INCOMPLETE,
     BuildResult,
     ContractError,
     Diagnostic,
     FirmwareBundle,
+    SourceFile,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,11 +45,18 @@ MAX_ERRORS = 5
 CONTEXT_LINES = 6  # lines shown before and after each error line
 HEAD_LINES = 20  # the include block, so a missing #include can be added
 NO_LINE_WINDOW = 60  # errors without a line number (linker) see the file head
+# A patch may not quietly delete code. Shrinking a file by more than this
+# share, or dropping a call, needs a stated reason (`removed`).
+MAX_SHRINK = 0.3
+GUARD_RETRIES = 1  # one more try, in the same attempt, after a rejected patch
 
-_SYSTEM_PROMPT = """You fix compile and link errors in STM32 HAL C firmware.
+_SYSTEM_PROMPT = """You fix STM32 HAL C firmware so it builds AND does its job.
 
-You are shown compiler diagnostics for ONE file and numbered excerpts of that
-file. Return line-range edits that make the errors go away.
+You are shown diagnostics for ONE file and numbered excerpts of that file.
+Diagnostics come from the compiler, or from the project checker (codes
+starting with `check-`): those mean the code compiles but is unfinished --
+a module main() never calls, a declared function nobody defined, a
+placeholder comment, a commented-out call. Fix the cause in code.
 
 Rules:
 1. Edit only lines that appear in the excerpts. `start_line`..`end_line` are
@@ -59,11 +69,16 @@ Rules:
    shown. A function that is declared nowhere does not exist: call one that is
    declared, or implement it as a `static` helper in this file. Never call a
    function you have not been shown. Do not invent HAL functions.
-4. Make the smallest change that fixes the error. Do not reformat other code.
-5. Reply with ONLY a JSON object:
+4. Never make an error disappear by deleting or commenting out the code that
+   has it, and never write "omitted", "TODO" or a placeholder. If removing a
+   call really is the correct fix, list it in "removed" with the reason; a
+   removal without a reason is rejected.
+5. Make the smallest change that fixes the error. Do not reformat other code.
+6. Reply with ONLY a JSON object:
 {
   "path": "Core/Src/example.c",
   "edits": [{"start_line": 12, "end_line": 12, "replacement": "  HAL_SPI_Init(&hspi1);"}],
+  "removed": [{"name": "old_call", "reason": "why removing it is right"}],
   "notes": ["what was wrong"]
 }"""
 
@@ -74,9 +89,16 @@ class LineEdit(BaseModel):
     replacement: str = ""
 
 
+class Removal(BaseModel):
+    name: str
+    reason: str = ""
+
+
 class FilePatch(BaseModel):
     path: str = ""
     edits: list[LineEdit] = Field(default_factory=list)
+    # Calls the model says it removed on purpose, each with a reason.
+    removed: list[Removal] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
 
 
@@ -88,15 +110,24 @@ class FilePatch(BaseModel):
 def repairable_errors(
     result: BuildResult, bundle: FirmwareBundle, limit: int = MAX_ERRORS
 ) -> list[Diagnostic]:
-    """Errors located in files the model wrote, first `limit` of them."""
+    """Errors located in files the model wrote, first `limit` of them.
+
+    main.c is the exception: the checker reports an uncalled module there,
+    and wiring a module into USER CODE is the model's job even when no step
+    listed main.c among the files to write.
+    """
     generated = {source.path for source in bundle.files if source.generated}
-    return [d for d in result.errors if d.file in generated][:limit]
+    return [
+        d
+        for d in result.errors
+        if d.file in generated or (d.tool == checks.TOOL and d.file == checks.MAIN)
+    ][:limit]
 
 
 def should_repair(result: BuildResult, bundle: FirmwareBundle, attempt: int) -> bool:
     """One rule, read by both the graph edge and the worker's progress rows."""
     return (
-        result.status == BUILD_FAILED
+        result.status in (BUILD_FAILED, BUILD_INCOMPLETE)
         and attempt <= settings.firmware_build_retries
         and bool(repairable_errors(result, bundle))
     )
@@ -178,6 +209,63 @@ def _markers(text: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# The guard: a repair may not delete its way to a clean build
+# --------------------------------------------------------------------------
+
+
+def _significant(text: str) -> int:
+    return sum(1 for line in text.split("\n") if line.strip())
+
+
+def guard_patch(
+    path: str,
+    original: str,
+    patched: str,
+    errors: list[Diagnostic],
+    removed: list[Removal],
+) -> tuple[list[str], list[str]]:
+    """(problems, accepted removals) for one patched file.
+
+    A call that disappears is fine when an error named it (replacing a call
+    to an undeclared `spi_bus_select` *is* the fix) or when the model listed
+    it under `removed` with a reason. Anything else is code deleted to make
+    an error go away, and so is a new placeholder or a file that shrank by
+    more than MAX_SHRINK.
+    """
+    named = " ".join(d.message for d in errors)
+    justified = {
+        item.name.strip(): item.reason.strip()
+        for item in removed
+        if item.name.strip() and len(item.reason.strip()) >= 10
+    }
+    lost = sorted(checks.calls(original) - checks.calls(patched))
+    unexplained = [name for name in lost if name not in named and name not in justified]
+    problems: list[str] = []
+    if unexplained:
+        problems.append(
+            f"the patch removed {', '.join(f'`{n}`' for n in unexplained)} without fixing "
+            "the cause"
+        )
+    if checks.unfinished_markers(path, patched) > checks.unfinished_markers(path, original):
+        problems.append("the patch added a placeholder comment or commented-out code")
+    before, after = _significant(original), _significant(patched)
+    if before >= 20 and after < before * (1 - MAX_SHRINK) and not justified:
+        problems.append(f"the patch deleted {before - after} of {before} lines")
+    accepted = [f"`{name}`: {justified[name]}" for name in lost if name in justified]
+    return problems, accepted
+
+
+def _guard_feedback(problems: list[str]) -> str:
+    return (
+        "Rejected: "
+        + "; ".join(problems)
+        + ". The code must still do what it did. Fix the error itself: declare, include, "
+        "implement or correct the call. If removing a call really is the right fix, "
+        'list it under "removed" with the reason. Reply with the corrected JSON only.'
+    )
+
+
+# --------------------------------------------------------------------------
 # The repair step
 # --------------------------------------------------------------------------
 
@@ -232,6 +320,7 @@ async def repair_firmware(
         "errors": [d.as_prompt() for d in errors],
         "files": {},
         "rejected": [],
+        "removed": [],
         "notes": [],
     }
     warnings: list[str] = []
@@ -266,25 +355,45 @@ async def repair_firmware(
                 ),
             },
         ]
-        try:
-            patch, repair_warnings, _ = await request_contract(
-                llm, FilePatch, messages, temperature=0.0
-            )
-            warnings.extend(repair_warnings)
-        except ContractError as exc:
-            warnings.append(f"repair: no usable patch for {path}: {exc}")
-            continue
+        patched = ""
+        applied = 0
+        for round_ in range(GUARD_RETRIES + 1):
+            try:
+                patch, repair_warnings, reply = await request_contract(
+                    llm, FilePatch, messages, temperature=0.0
+                )
+                warnings.extend(repair_warnings)
+            except ContractError as exc:
+                warnings.append(f"repair: no usable patch for {path}: {exc}")
+                applied = 0
+                break
 
-        new_lines, applied, rejected = apply_edits(lines, patch.edits, windows)
-        report["rejected"].extend(f"{path}: {message}" for message in rejected)
-        report["notes"].extend(f"{path}: {note}" for note in patch.notes)
+            new_lines, applied, rejected = apply_edits(lines, patch.edits, windows)
+            report["rejected"].extend(f"{path}: {message}" for message in rejected)
+            report["notes"].extend(f"{path}: {note}" for note in patch.notes)
+            if not applied:
+                break
+            patched = "\n".join(new_lines)
+            if _markers(patched) != _markers(original):
+                report["rejected"].append(f"{path}: patch changed USER CODE markers")
+                applied = 0
+                break
+
+            problems, removals = guard_patch(path, original, patched, file_errors, patch.removed)
+            if not problems:
+                for removal in removals:
+                    report["removed"].append(f"{path}: {removal}")
+                    warnings.append(f"repair removed {removal} from {path}")
+                break
+            report["rejected"].append(f"{path}: {'; '.join(problems)}")
+            applied = 0
+            if round_ < GUARD_RETRIES:
+                messages = [
+                    *messages,
+                    {"role": "assistant", "content": reply},
+                    {"role": "user", "content": _guard_feedback(problems)},
+                ]
         if not applied:
-            report["files"][path] = 0
-            continue
-
-        patched = "\n".join(new_lines)
-        if _markers(patched) != _markers(original):
-            report["rejected"].append(f"{path}: patch changed USER CODE markers")
             report["files"][path] = 0
             continue
 
@@ -297,6 +406,9 @@ async def repair_firmware(
         for index, source in enumerate(updated.files):
             if source.path == path:
                 updated.files[index] = source.model_copy(update={"contents": patched})
+                break
+        else:
+            updated.files.append(SourceFile(path=path, contents=patched, purpose="repair"))
         report["files"][path] = applied
 
     if not any(report["files"].values()):
