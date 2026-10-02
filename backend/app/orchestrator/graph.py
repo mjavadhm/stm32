@@ -1,10 +1,11 @@
-"""Workflow graph (M3).
+"""Workflow graph (M3, extended in M4).
 
 The router is the first node, not a step hidden inside the API handler. Every
 run therefore starts the same way, and the routing decision is visible in the
 progress view like any other agent.
 
-    router ─┬─ full_project ─> requirements -> datasheet -> architecture -> cubemx -> firmware -> END
+    router ─┬─ full_project ─> requirements -> datasheet -> architecture
+            │                  -> cubemx -> firmware -> build -> END
             └─ debug/optimize/test ─> mock_copilot -> END
 
 `_PIPELINES` is the single source of truth for both the graph edges and the
@@ -16,6 +17,7 @@ those two copies were one edit away from disagreeing.
 from langgraph.graph import END, StateGraph
 
 from app.agents.architecture import architecture_node
+from app.agents.build import build_node
 from app.agents.cubemx import cubemx_node
 from app.agents.datasheet import datasheet_node
 from app.agents.firmware import firmware_node
@@ -29,7 +31,14 @@ ROUTER_NODE = "router"
 
 # request_type -> the agents that run after the router, in order.
 _PIPELINES: dict[str, list[str]] = {
-    RequestType.full_project.value: ["requirements", "datasheet", "architecture", "cubemx", "firmware"],
+    RequestType.full_project.value: [
+        "requirements",
+        "datasheet",
+        "architecture",
+        "cubemx",
+        "firmware",
+        "build",
+    ],
     RequestType.debug.value: ["mock_copilot"],
     RequestType.optimize.value: ["mock_copilot"],
     RequestType.test.value: ["mock_copilot"],
@@ -42,6 +51,7 @@ _NODES = {
     "architecture": architecture_node,
     "cubemx": cubemx_node,
     "firmware": firmware_node,
+    "build": build_node,
     "mock_copilot": mock_copilot,  # replaced by real agents in M5
 }
 

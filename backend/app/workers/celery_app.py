@@ -39,11 +39,12 @@ def run_pipeline(project_id: str) -> str:
 async def _run_pipeline_and_cleanup(project_id: str) -> str:
     """Run the pipeline, then dispose every async client this loop created.
 
-    The OpenAI and PageVault clients are cached singletons, while each task
+    The OpenAI, PageVault and builder clients are cached singletons, while each task
     gets its own event loop. Reusing a connection pool across loops raises
     "Event loop is closed" on the second task of a worker process, so the
     clients are torn down when the loop that opened them ends.
     """
+    from app.build.client import close_builder_client
     from app.core.llm import aclose_llm_clients
     from app.rag import close_rag_client
 
@@ -54,6 +55,7 @@ async def _run_pipeline_and_cleanup(project_id: str) -> str:
             return await _run_pipeline(project_id)
     finally:
         await close_rag_client()
+        await close_builder_client()
         await aclose_llm_clients()
 
 
