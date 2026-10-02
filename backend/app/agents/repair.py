@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 from app.agents.base import request_contract
 from app.build import workspace
 from app.codegen import checks
+from app.codegen.ownership import strip_owned
 from app.core.config import settings
 from app.core.llm import get_agent_llm, is_agent_enabled
 from app.orchestrator.contracts import (
@@ -396,6 +397,11 @@ async def repair_firmware(
         if not applied:
             report["files"][path] = 0
             continue
+        # A patch must not bring back what the scaffold owns.
+        owned_contents, owned = strip_owned(path, patched)
+        if owned and owned_contents is not None:
+            patched = owned_contents
+            report["removed"].append(f"{path}: scaffold-owned {', '.join(owned)}")
 
         if project_id:
             try:

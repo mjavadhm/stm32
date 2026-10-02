@@ -15,6 +15,7 @@ import logging
 from typing import Any
 
 from app.agents.base import request_contract
+from app.codegen.ownership import OWNERSHIP_RULE, scaffold_owned_path
 from app.core.llm import get_agent_llm
 from app.orchestrator.contracts import (
     Architecture,
@@ -53,6 +54,8 @@ Rules:
 - "implementation_order" must be buildable step by step: each step should
   compile and be testable before the next one starts.
 - "file_tree" lists the files to be created, as paths.
+- Modules are drivers (one per external device) and application logic only.
+  {ownership}
 
 Reply with ONLY a JSON object, no commentary, in exactly this shape:
 {
@@ -61,7 +64,7 @@ Reply with ONLY a JSON object, no commentary, in exactly this shape:
   "rtos": "none",
   "modules": [
     {"name": "mpu6050", "path": "Core/Src/mpu6050.c", "layer": "driver",
-     "responsibility": "...", "depends_on": ["spi_bus"], "citations": []}
+     "responsibility": "...", "depends_on": [], "citations": []}
   ],
   "peripherals": [
     {"peripheral": "SPI1", "mode": "master, full-duplex, 8-bit",
@@ -70,12 +73,49 @@ Reply with ONLY a JSON object, no commentary, in exactly this shape:
   ],
   "file_tree": ["Core/Src/main.c"],
   "implementation_order": [
-    {"order": 1, "title": "...", "detail": "...", "modules": ["spi_bus"],
-     "files": ["Core/Src/spi_bus.c"], "citations": []}
+    {"order": 1, "title": "...", "detail": "...", "modules": ["mpu6050"],
+     "files": ["Core/Inc/mpu6050.h", "Core/Src/mpu6050.c"], "citations": []}
   ],
   "risks": [],
   "assumptions": []
-}"""
+}""".replace("{ownership}", OWNERSHIP_RULE)
+
+
+def _enforce_ownership(architecture: Architecture) -> tuple[Architecture, list[str]]:
+    """Take scaffold-owned files out of the plan before M4 walks it.
+
+    A step that plans `spi1.c` gets a model to write CubeMX init a second
+    time; dropping the path here costs nothing and saves a broken build.
+    """
+    owned = sorted(
+        {
+            path
+            for path in [
+                *architecture.file_tree,
+                *(module.path for module in architecture.modules),
+                *(path for step in architecture.implementation_order for path in step.files),
+            ]
+            if path and scaffold_owned_path(path)
+        }
+    )
+    if not owned:
+        return architecture, []
+    steps = []
+    for step in architecture.implementation_order:
+        files = [path for path in step.files if path not in owned]
+        if step.files and not files:
+            continue
+        steps.append(step.model_copy(update={"order": len(steps) + 1, "files": files}))
+    return (
+        architecture.model_copy(
+            update={
+                "file_tree": [p for p in architecture.file_tree if p not in owned],
+                "modules": [m for m in architecture.modules if m.path not in owned],
+                "implementation_order": steps,
+            }
+        ),
+        [f"{path}: owned by the CubeMX scaffold; dropped from the plan" for path in owned],
+    )
 
 
 def build_user_prompt(
@@ -262,6 +302,8 @@ async def design_architecture(
     warnings.extend(repair_warnings)
     architecture, evidence_warnings = _enforce_evidence(architecture, hardware)
     warnings.extend(evidence_warnings)
+    architecture, ownership_warnings = _enforce_ownership(architecture)
+    warnings.extend(ownership_warnings)
 
     if not hardware.grounded:
         warnings.append(

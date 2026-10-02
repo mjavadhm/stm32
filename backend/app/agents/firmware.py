@@ -22,6 +22,13 @@ from pydantic import BaseModel, Field
 from app.agents.base import request_contract
 from app.agents.repair import repair_firmware
 from app.build import workspace
+from app.codegen.ownership import (
+    OWNERSHIP_RULE,
+    drop_includes,
+    scaffold_file,
+    scaffold_owned_path,
+    strip_owned,
+)
 from app.codegen.peripherals import HANDLE_TYPES, is_chip_select, pin_label
 from app.codegen.render import merge_user_code, render, user_regions
 from app.codegen.scaffold import scaffold_project
@@ -87,7 +94,7 @@ _BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 _LINE_COMMENT_RE = re.compile(r"//[^\n]*")
 _DEFINE_RE = re.compile(r"#\s*define\s+(?P<name>\w+(?:\([^)]*\))?)\s+(?P<body>\S.*)$")
 
-_SYSTEM_PROMPT = """You are an expert embedded firmware engineer writing C for STM32.
+_SYSTEM_PROMPT = f"""You are an expert embedded firmware engineer writing C for STM32.
 
 Write complete, compile-clean C source or header files according to the requirements,
 architecture, and peripheral configuration.
@@ -95,6 +102,7 @@ architecture, and peripheral configuration.
 Rules:
 1. Always use exact CubeMX HAL handle names provided (e.g. `hspi1`, `huart2`, `hi2c1`).
    Do NOT invent handle names like `spi1_handle`.
+   {OWNERSHIP_RULE}
 2. For `Core/Src/main.c` and `Core/Inc/main.h`:
    - All user code MUST be placed inside the standard CubeMX user code markers:
      `/* USER CODE BEGIN <Section> */`
@@ -116,13 +124,13 @@ Rules:
    is not covered by retrieved documentation, leave citations empty and note it
    under "assumptions".
 6. Reply with ONLY a JSON object in this format:
-{
+{{
   "path": "Core/Src/example.c",
   "purpose": "Brief description of the file",
   "contents": "/* Complete file contents or USER CODE sections */",
   "citations": [],
   "assumptions": []
-}"""
+}}"""
 
 
 class FileProposal(BaseModel):
@@ -456,8 +464,18 @@ async def generate_firmware(
             )
         ]
 
+    dropped: set[str] = set()
     for step in steps:
-        step_files = step.files
+        step_files = []
+        for file_path in step.files:
+            if scaffold_owned_path(file_path):
+                # The scaffold writes this file; a generated copy only
+                # duplicates its symbols.
+                warnings.append(f"{file_path}: owned by the CubeMX scaffold; not generated")
+                if not scaffold_file(file_path):
+                    dropped.add(file_path)
+            else:
+                step_files.append(file_path)
         if not step_files:
             continue
 
@@ -512,6 +530,20 @@ async def generate_firmware(
                 final_contents = _merge_scaffold_file(
                     file_path, proposal.contents, scaffold_content
                 )
+
+            owned_contents, owned = strip_owned(file_path, final_contents)
+            if owned_contents is None:
+                warnings.append(
+                    f"{file_path}: only re-implemented scaffold code "
+                    f"({', '.join(owned)}); dropped"
+                )
+                dropped.add(file_path)
+                continue
+            if owned:
+                warnings.append(
+                    f"{file_path}: removed scaffold-owned {', '.join(owned)}"
+                )
+                final_contents = owned_contents
 
             valid_citations: list[str] = []
             for citation in proposal.citations:
@@ -571,6 +603,16 @@ async def generate_firmware(
                 )
             deduped[source_file.path] = source_file
         generated_files = list(deduped.values())
+
+    # A dropped header must not stay included: the build would stop on it.
+    dropped_headers = {path for path in dropped if path.endswith(".h")}
+    if dropped_headers:
+        generated_files = [
+            source_file.model_copy(
+                update={"contents": drop_includes(source_file.contents, dropped_headers)}
+            )
+            for source_file in generated_files
+        ]
 
     notes = [f"Generated {len(generated_files)} files across {len(steps)} steps."]
     if hardware.coverage < _LOW_COVERAGE:
