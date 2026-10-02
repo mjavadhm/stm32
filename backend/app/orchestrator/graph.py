@@ -1,11 +1,17 @@
-"""Workflow graph (M3).
+"""Workflow graph (M3, extended in M4).
 
 The router is the first node, not a step hidden inside the API handler. Every
 run therefore starts the same way, and the routing decision is visible in the
 progress view like any other agent.
 
-    router ─┬─ full_project ─> requirements -> datasheet -> architecture -> cubemx -> firmware -> END
+    router ─┬─ full_project ─> requirements -> datasheet -> architecture
+            │                  -> cubemx -> firmware -> build ─┬─> END
+            │                               ^   (repair_next)  │
+            │                               `──────────────────┘
             └─ debug/optimize/test ─> mock_copilot -> END
+
+The build -> firmware edge is the bounded repair loop (app/agents/repair.py):
+the build node decides `repair_next`, this edge only reads it.
 
 `_PIPELINES` is the single source of truth for both the graph edges and the
 progress rows the worker creates. The previous version encoded the same
@@ -16,6 +22,7 @@ those two copies were one edit away from disagreeing.
 from langgraph.graph import END, StateGraph
 
 from app.agents.architecture import architecture_node
+from app.agents.build import build_node
 from app.agents.cubemx import cubemx_node
 from app.agents.datasheet import datasheet_node
 from app.agents.firmware import firmware_node
@@ -26,10 +33,20 @@ from app.db.models import RequestType
 from app.orchestrator.state import PipelineState
 
 ROUTER_NODE = "router"
+BUILD_NODE = "build"
+# Re-run, in this order, for each repair round after a failed build.
+REPAIR_AGENTS = ("firmware", BUILD_NODE)
 
 # request_type -> the agents that run after the router, in order.
 _PIPELINES: dict[str, list[str]] = {
-    RequestType.full_project.value: ["requirements", "datasheet", "architecture", "cubemx", "firmware"],
+    RequestType.full_project.value: [
+        "requirements",
+        "datasheet",
+        "architecture",
+        "cubemx",
+        "firmware",
+        BUILD_NODE,
+    ],
     RequestType.debug.value: ["mock_copilot"],
     RequestType.optimize.value: ["mock_copilot"],
     RequestType.test.value: ["mock_copilot"],
@@ -42,6 +59,7 @@ _NODES = {
     "architecture": architecture_node,
     "cubemx": cubemx_node,
     "firmware": firmware_node,
+    BUILD_NODE: build_node,
     "mock_copilot": mock_copilot,  # replaced by real agents in M5
 }
 
@@ -77,6 +95,10 @@ def _route_after_router(state: PipelineState) -> str:
     return pipeline_for(state.get("request_type", RequestType.full_project.value))[0]
 
 
+def _route_after_build(state: PipelineState) -> str:
+    return REPAIR_AGENTS[0] if state.get("repair_next") else END
+
+
 def build_graph():
     graph = StateGraph(PipelineState)
     for name, node in _NODES.items():
@@ -97,8 +119,16 @@ def build_graph():
             if (current, following) not in linked:
                 graph.add_edge(current, following)
                 linked.add((current, following))
-        if (pipeline[-1], END) not in linked:
+        if (pipeline[-1], END) in linked:
+            continue
+        if pipeline[-1] == BUILD_NODE:
+            graph.add_conditional_edges(
+                BUILD_NODE,
+                _route_after_build,
+                {REPAIR_AGENTS[0]: REPAIR_AGENTS[0], END: END},
+            )
+        else:
             graph.add_edge(pipeline[-1], END)
-            linked.add((pipeline[-1], END))
+        linked.add((pipeline[-1], END))
 
     return graph.compile()

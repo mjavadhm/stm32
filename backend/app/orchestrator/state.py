@@ -30,5 +30,13 @@ class PipelineState(TypedDict, total=False):
     firmware: dict[str, Any]
     firmware_artifacts: dict[str, Any]
 
+    # --- build (M4 P5) ---
+    # Which firmware/build round this is. 1 until the repair loop retries.
+    attempt: int
+    build: dict[str, Any]
+    build_artifacts: dict[str, Any]
+    # Set by the build node: route back to the firmware agent for a repair.
+    repair_next: bool
+
     # --- copilot path (still mocked until M5) ---
     copilot_result: str

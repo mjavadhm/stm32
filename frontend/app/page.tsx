@@ -2,6 +2,8 @@
 
 import { FormEvent, useCallback, useEffect, useState } from "react";
 
+import ProjectOutput from "./project-output";
+
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 type PinSelectionPolicy = "deterministic" | "explicit" | "llm";
@@ -19,6 +21,7 @@ type ProjectSummary = {
 
 type TaskInfo = {
   agent_name: string;
+  attempt: number;
   status: string;
   result: string | null;
   error: string | null;
@@ -304,9 +307,10 @@ export default function Home() {
                 </thead>
                 <tbody>
                   {detail.tasks.map((t) => (
-                    <tr key={t.agent_name}>
+                    <tr key={`${t.agent_name}-${t.attempt}`}>
                       <td>
                         <code>{t.agent_name}</code>
+                        {t.attempt > 1 && <span className="muted small"> #{t.attempt}</span>}
                       </td>
                       <td>
                         <StatusBadge status={t.status} />
@@ -332,6 +336,19 @@ export default function Home() {
           )}
         </section>
       </div>
+
+      {/* خروجی پروژه: build، فایل‌ها، دانلود */}
+      {detail && detail.request_type === "full_project" && (
+        <section className="card">
+          <h2>خروجی پروژه</h2>
+          <ProjectOutput
+            apiUrl={API_URL}
+            projectId={detail.id}
+            projectStatus={detail.status}
+            version={detail.tasks.map((t) => `${t.agent_name}:${t.attempt}:${t.status}`).join("|")}
+          />
+        </section>
+      )}
 
       {/* تنظیمات ایجنت‌ها */}
       <section className="card">

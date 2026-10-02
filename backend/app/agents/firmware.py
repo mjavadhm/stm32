@@ -20,6 +20,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from app.agents.base import request_contract
+from app.agents.repair import repair_firmware
 from app.build import workspace
 from app.codegen.peripherals import HANDLE_TYPES
 from app.codegen.render import merge_user_code, render, user_regions
@@ -29,6 +30,7 @@ from app.core.llm import get_agent_llm, is_agent_enabled
 from app.orchestrator.contracts import (
     Architecture,
     ContractError,
+    BuildResult,
     CubeMXPlan,
     FirmwareBundle,
     HardwareFindings,
@@ -587,7 +589,15 @@ async def generate_firmware(
 
 
 async def firmware_node(state: dict[str, Any]) -> dict[str, Any]:
-    """LangGraph node for the Firmware Agent."""
+    """LangGraph node for the Firmware Agent.
+
+    Entered twice in a run when the build failed: the second time (the build
+    node set `repair_next`) it patches the existing files instead of
+    regenerating them, and bumps `attempt` for the next build.
+    """
+    if state.get("repair_next"):
+        return await _repair_node(state)
+
     requirements = parse_stored(Requirements, state.get("requirements"))
     hardware = parse_stored(HardwareFindings, state.get("hardware"))
     architecture = parse_stored(Architecture, state.get("architecture"))
@@ -612,4 +622,48 @@ async def firmware_node(state: dict[str, Any]) -> dict[str, Any]:
             "files": bundle.paths,
             "warnings": warnings,
         },
+        "attempt": 1,
+        "repair_next": False,
+    }
+
+
+def _repair_context(plan: CubeMXPlan, bundle: FirmwareBundle) -> str:
+    """Hardware config plus every project header's declarations.
+
+    The repair model sees excerpts of one file only. Without the headers it
+    guesses at what the other files offer -- the first real run "fixed" a
+    missing `MPU6050_Select` by calling an equally non-existent
+    `spi_bus_select`, citing a header it had never been shown.
+    """
+    return "\n".join(
+        [
+            _cubemx_context(plan),
+            "\n# Project headers (the only project functions and types that exist)",
+            _headers_context(bundle.files),
+        ]
+    )
+
+
+async def _repair_node(state: dict[str, Any]) -> dict[str, Any]:
+    bundle = parse_stored(FirmwareBundle, state.get("firmware"))
+    result = parse_stored(BuildResult, state.get("build"))
+    plan = parse_stored(CubeMXPlan, state.get("cubemx"))
+    attempt = int(state.get("attempt") or 1) + 1
+
+    bundle, warnings, report = await repair_firmware(
+        bundle,
+        result,
+        project_id=state.get("project_id", ""),
+        context=_repair_context(plan, bundle),
+    )
+    return {
+        "firmware": dump(bundle),
+        "firmware_artifacts": {
+            "file_count": len(bundle.files),
+            "files": bundle.paths,
+            "warnings": warnings,
+            "repair": report,
+        },
+        "attempt": attempt,
+        "repair_next": False,
     }

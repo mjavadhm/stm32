@@ -2,6 +2,7 @@ import uuid
 from datetime import UTC, datetime
 from enum import StrEnum
 
+from sqlalchemy import UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 
@@ -47,16 +48,94 @@ class Project(SQLModel, table=True):
 
 
 class TaskRun(SQLModel, table=True):
-    """One agent execution inside a project pipeline (centralized run log)."""
+    """One agent execution inside a project pipeline (centralized run log).
+
+    `attempt` separates repeated executions of the same agent in the same
+    project (M4 repair loop: firmware -> build -> firmware(patch) -> build).
+    Attempts start at 1; the row with the highest attempt is the current one.
+    """
+
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "agent_name",
+            "attempt",
+            name="uq_taskrun_project_agent_attempt",
+        ),
+    )
 
     id: str = Field(default_factory=lambda: uuid.uuid4().hex, primary_key=True)
     project_id: str = Field(foreign_key="project.id", index=True)
     agent_name: str
+    attempt: int = 1
     status: RunStatus = RunStatus.pending
     result: str | None = None  # JSON payload produced by the agent
     error: str | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+
+
+class ArtifactKind(StrEnum):
+    """What a stored project file is, so the API can filter without guessing
+    from extensions."""
+
+    source = "source"          # generated or scaffolded C/H/asm/Makefile/ld
+    ioc = "ioc"                # CubeMX project file
+    binary = "binary"          # .elf / .bin / .hex produced by a build
+    build_log = "build_log"    # full compiler/linker log of one build
+    archive = "archive"        # downloadable project zip
+
+
+class Artifact(SQLModel, table=True):
+    """Index of one file produced for a project.
+
+    Contents live on disk under ``WORKSPACE_DIR/{project_id}/``; this table
+    only records what exists, which attempt produced it and a content hash,
+    so the delivery API (P6) and the repair loop (P5) never have to walk the
+    filesystem to answer "what changed between attempt 1 and 2".
+    """
+
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "path",
+            "attempt",
+            name="uq_artifact_project_path_attempt",
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: uuid.uuid4().hex, primary_key=True)
+    project_id: str = Field(foreign_key="project.id", index=True)
+    task_run_id: str | None = Field(default=None, foreign_key="taskrun.id")
+    kind: str = ArtifactKind.source.value
+    # Relative to the project workspace, POSIX separators, never absolute.
+    path: str
+    attempt: int = 1
+    sha256: str | None = None
+    size_bytes: int | None = None
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class AgentCall(SQLModel, table=True):
+    """One LLM request made on behalf of a project (token/cost telemetry).
+
+    Written best-effort by ``app.core.usage``; a failure to record never
+    fails the agent. Token counts are NULL when the provider does not report
+    usage (some OpenAI-compatible servers omit it).
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    project_id: str | None = Field(default=None, foreign_key="project.id", index=True)
+    agent_name: str
+    attempt: int | None = None
+    model: str
+    status: str = "ok"  # ok | error
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    duration_ms: int | None = None
+    error: str | None = None
+    created_at: datetime = Field(default_factory=utcnow)
 
 
 class AgentSetting(SQLModel, table=True):

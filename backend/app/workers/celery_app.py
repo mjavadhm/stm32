@@ -36,21 +36,42 @@ def run_pipeline(project_id: str) -> str:
     return asyncio.run(_run_pipeline_and_cleanup(project_id))
 
 
+@celery_app.task(name="rebuild_project")
+def rebuild_project(project_id: str, attempt: int) -> str:
+    """Manual `POST /projects/{id}/build`: compile the workspace as it is now."""
+    return asyncio.run(_rebuild_and_cleanup(project_id, attempt))
+
+
+async def _rebuild_and_cleanup(project_id: str, attempt: int) -> str:
+    from app.build.client import close_builder_client
+    from app.build.rebuild import rebuild
+
+    try:
+        return await rebuild(project_id, attempt)
+    finally:
+        await close_builder_client()
+
+
 async def _run_pipeline_and_cleanup(project_id: str) -> str:
     """Run the pipeline, then dispose every async client this loop created.
 
-    The OpenAI and PageVault clients are cached singletons, while each task
+    The OpenAI, PageVault and builder clients are cached singletons, while each task
     gets its own event loop. Reusing a connection pool across loops raises
     "Event loop is closed" on the second task of a worker process, so the
     clients are torn down when the loop that opened them ends.
     """
+    from app.build.client import close_builder_client
     from app.core.llm import aclose_llm_clients
     from app.rag import close_rag_client
 
+    from app.core.usage import llm_call_scope
+
     try:
-        return await _run_pipeline(project_id)
+        with llm_call_scope(project_id):
+            return await _run_pipeline(project_id)
     finally:
         await close_rag_client()
+        await close_builder_client()
         await aclose_llm_clients()
 
 
@@ -58,8 +79,11 @@ async def _run_pipeline(project_id: str) -> str:
     from sqlmodel import Session, select
 
     from app.db.models import Project, RunStatus, TaskRun
+    from app.db.runs import latest_task, start_new_attempt
     from app.db.session import engine
     from app.orchestrator.graph import (
+        BUILD_NODE,
+        REPAIR_AGENTS,
         ROUTER_NODE,
         agent_sequence_for,
         build_graph,
@@ -67,12 +91,9 @@ async def _run_pipeline(project_id: str) -> str:
     )
 
     def _set_task(session: Session, agent_name: str, **updates) -> None:
-        task = session.exec(
-            select(TaskRun).where(
-                TaskRun.project_id == project_id,
-                TaskRun.agent_name == agent_name,
-            )
-        ).first()
+        # Always the highest attempt: once the repair loop exists, an agent
+        # can have several rows and only the newest one is live.
+        task = latest_task(session, project_id, agent_name)
         if task is None:
             task = TaskRun(project_id=project_id, agent_name=agent_name)
         for key, value in updates.items():
@@ -215,8 +236,19 @@ async def _run_pipeline(project_id: str) -> str:
                                     )
                                 )
 
+                    # A failed build that will be repaired: firmware and build
+                    # run again, each under a new attempt row, so attempt 1's
+                    # rows (and their results) stay as they were.
+                    repairing = node_name == BUILD_NODE and bool(update.get("repair_next"))
+                    if repairing:
+                        for agent_name in REPAIR_AGENTS:
+                            start_new_attempt(session, project_id, agent_name)
+                        session.flush()
+
                     # Advance the running marker to whatever comes next.
-                    if node_name in sequence:
+                    if repairing and REPAIR_AGENTS[0] in sequence:
+                        position = sequence.index(REPAIR_AGENTS[0])
+                    elif node_name in sequence:
                         position = sequence.index(node_name) + 1
                     else:
                         position += 1

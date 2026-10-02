@@ -66,6 +66,27 @@ def _make_list(paths: list[str]) -> str:
     return " \\\n".join(paths)
 
 
+MANAGED_SOURCES = (
+    "Core/Src/main.c",
+    "Core/Src/stm32f4xx_it.c",
+    "Core/Src/stm32f4xx_hal_msp.c",
+)
+
+
+def c_source_list(user_sources: list[str], sdk_sources: list[str]) -> list[str]:
+    """The Makefile's C_SOURCES: managed files, then the model's, then ST's.
+
+    A refresh globs Core/Src, which also holds files the SDK copy put there
+    (system_stm32f4xx.c). Listing one twice links it twice -- "multiple
+    definition of SystemCoreClock" -- an error no repair of model code can fix,
+    so every path appears once, in first-seen order.
+    """
+    sdk_c = [path for path in sdk_sources if path.endswith(".c")]
+    taken = set(MANAGED_SOURCES) | set(sdk_c)
+    model = [path for path in user_sources if path.endswith(".c") and path not in taken]
+    return list(dict.fromkeys([*MANAGED_SOURCES, *model, *sdk_c]))
+
+
 def _clock_summary(plan: CubeMXPlan) -> str:
     clock = plan.clock
     source = str(clock.source or "hsi").upper().replace("_BYPASS", " (bypass)")
@@ -174,22 +195,9 @@ def scaffold_project(
         base = workspace.workspace_path(project_id)
         src_dir = base / "Core" / "Src"
         if src_dir.is_dir():
-            for p in sorted(src_dir.glob("*.c")):
-                rel = str(p.relative_to(base))
-                if rel not in (
-                    "Core/Src/main.c",
-                    "Core/Src/stm32f4xx_it.c",
-                    "Core/Src/stm32f4xx_hal_msp.c",
-                ):
-                    user_sources.append(rel)
+            user_sources = [str(p.relative_to(base)) for p in sorted(src_dir.glob("*.c"))]
 
-    c_sources = [
-        "Core/Src/main.c",
-        "Core/Src/stm32f4xx_it.c",
-        "Core/Src/stm32f4xx_hal_msp.c",
-        *user_sources,
-        *[path for path in copy.sources if path.endswith(".c")],
-    ]
+    c_sources = c_source_list(user_sources, copy.sources)
     asm_sources = [path for path in copy.sources if path.endswith(".s")]
     includes = ["Core/Inc", *copy.includes]
     result.sources = [*c_sources, *asm_sources]

@@ -402,6 +402,7 @@ def test_full_project_runs_the_design_pipeline():
         "architecture",
         "cubemx",
         "firmware",
+        "build",
     ]
 
 
