@@ -63,9 +63,11 @@ async def _run_pipeline(project_id: str) -> str:
     from sqlmodel import Session, select
 
     from app.db.models import Project, RunStatus, TaskRun
-    from app.db.runs import latest_task
+    from app.db.runs import latest_task, start_new_attempt
     from app.db.session import engine
     from app.orchestrator.graph import (
+        BUILD_NODE,
+        REPAIR_AGENTS,
         ROUTER_NODE,
         agent_sequence_for,
         build_graph,
@@ -218,8 +220,19 @@ async def _run_pipeline(project_id: str) -> str:
                                     )
                                 )
 
+                    # A failed build that will be repaired: firmware and build
+                    # run again, each under a new attempt row, so attempt 1's
+                    # rows (and their results) stay as they were.
+                    repairing = node_name == BUILD_NODE and bool(update.get("repair_next"))
+                    if repairing:
+                        for agent_name in REPAIR_AGENTS:
+                            start_new_attempt(session, project_id, agent_name)
+                        session.flush()
+
                     # Advance the running marker to whatever comes next.
-                    if node_name in sequence:
+                    if repairing and REPAIR_AGENTS[0] in sequence:
+                        position = sequence.index(REPAIR_AGENTS[0])
+                    elif node_name in sequence:
                         position = sequence.index(node_name) + 1
                     else:
                         position += 1

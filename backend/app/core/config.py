@@ -109,6 +109,9 @@ class Settings(BaseSettings):
     # the `workspaces` volume, so only a path crosses the wire, never source.
     builder_url: str = "http://builder:9000"
     build_timeout_seconds: float = 120.0
+    # Repair rounds after a failed build: errors in model-written files go
+    # back to the firmware agent at most this many times (N+1 builds total).
+    firmware_build_retries: int = 2
     workspace_root: str = "/workspaces"
     # ST's HAL and CMSIS sources. Downloaded into the build image (never
     # committed to git) and mounted here read-only, so the scaffold can copy

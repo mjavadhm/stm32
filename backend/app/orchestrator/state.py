@@ -35,6 +35,8 @@ class PipelineState(TypedDict, total=False):
     attempt: int
     build: dict[str, Any]
     build_artifacts: dict[str, Any]
+    # Set by the build node: route back to the firmware agent for a repair.
+    repair_next: bool
 
     # --- copilot path (still mocked until M5) ---
     copilot_result: str

@@ -3,12 +3,14 @@
 Runs after the firmware agent. It never fails the pipeline: a project that
 does not compile is still a delivered project, with its diagnostics attached
 (docs/m4-plan.md, P5). The repair loop that feeds those diagnostics back to
-the firmware agent is added on top of this node, not inside it.
+the firmware agent sits on top of this node: it only decides `repair_next`,
+and the graph edge after it reads that flag (app/agents/repair.py).
 """
 
 import logging
 from typing import Any
 
+from app.agents.repair import should_repair
 from app.build import workspace
 from app.build.artifacts import BUILD_LOG_PATH, record_artifacts
 from app.build.client import BuilderClient, get_builder_client
@@ -18,6 +20,7 @@ from app.orchestrator.contracts import (
     BUILD_UNAVAILABLE,
     BuildResult,
     CubeMXPlan,
+    FirmwareBundle,
     dump,
     parse_stored,
 )
@@ -115,4 +118,8 @@ async def build_node(state: dict[str, Any]) -> dict[str, Any]:
         len(result.errors),
         len(result.warnings),
     )
-    return {"build": dump(result), "build_artifacts": summarise_result(result)}
+    bundle = parse_stored(FirmwareBundle, state.get("firmware"))
+    repair_next = should_repair(result, bundle, attempt)
+    summary = summarise_result(result)
+    summary["repair_next"] = repair_next
+    return {"build": dump(result), "build_artifacts": summary, "repair_next": repair_next}
