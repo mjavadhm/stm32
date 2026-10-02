@@ -47,8 +47,11 @@ async def _run_pipeline_and_cleanup(project_id: str) -> str:
     from app.core.llm import aclose_llm_clients
     from app.rag import close_rag_client
 
+    from app.core.usage import llm_call_scope
+
     try:
-        return await _run_pipeline(project_id)
+        with llm_call_scope(project_id):
+            return await _run_pipeline(project_id)
     finally:
         await close_rag_client()
         await aclose_llm_clients()
@@ -58,6 +61,7 @@ async def _run_pipeline(project_id: str) -> str:
     from sqlmodel import Session, select
 
     from app.db.models import Project, RunStatus, TaskRun
+    from app.db.runs import latest_task
     from app.db.session import engine
     from app.orchestrator.graph import (
         ROUTER_NODE,
@@ -67,12 +71,9 @@ async def _run_pipeline(project_id: str) -> str:
     )
 
     def _set_task(session: Session, agent_name: str, **updates) -> None:
-        task = session.exec(
-            select(TaskRun).where(
-                TaskRun.project_id == project_id,
-                TaskRun.agent_name == agent_name,
-            )
-        ).first()
+        # Always the highest attempt: once the repair loop exists, an agent
+        # can have several rows and only the newest one is live.
+        task = latest_task(session, project_id, agent_name)
         if task is None:
             task = TaskRun(project_id=project_id, agent_name=agent_name)
         for key, value in updates.items():

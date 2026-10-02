@@ -22,6 +22,7 @@ from functools import lru_cache
 from openai import AsyncOpenAI
 
 from app.core.config import settings
+from app.core.usage import record_agent_call
 
 logger = logging.getLogger(__name__)
 
@@ -177,10 +178,28 @@ class AgentLLM:
     async def chat(self, messages: list[dict], **kwargs) -> str:
         if settings.llm_max_tokens and "max_tokens" not in kwargs:
             kwargs["max_tokens"] = settings.llm_max_tokens
-        resp = await self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            **kwargs,
+        started = time.monotonic()
+        try:
+            resp = await self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                **kwargs,
+            )
+        except Exception as exc:
+            await record_agent_call(
+                self.agent_name,
+                self.model,
+                status="error",
+                duration_ms=int((time.monotonic() - started) * 1000),
+                error=str(exc),
+            )
+            raise
+        await record_agent_call(
+            self.agent_name,
+            self.model,
+            status="ok",
+            usage=getattr(resp, "usage", None),
+            duration_ms=int((time.monotonic() - started) * 1000),
         )
         return resp.choices[0].message.content or ""
 

@@ -90,6 +90,7 @@ def get_project(project_id: str, session: Session = Depends(get_session)) -> dic
         "tasks": [
             {
                 "agent_name": t.agent_name,
+                "attempt": t.attempt,
                 "status": t.status,
                 "result": t.result,
                 "error": t.error,
