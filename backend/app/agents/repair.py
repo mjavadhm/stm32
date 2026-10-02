@@ -54,8 +54,11 @@ Rules:
    use \\n between lines). To delete lines use an empty replacement. To insert,
    replace one shown line with itself plus the new lines.
 2. Never remove or rename `/* USER CODE BEGIN ... */` or `/* USER CODE END ... */`.
-3. Use only the peripheral handles listed in the configuration (e.g. `hspi1`).
-   Do not invent HAL functions; prefer fixing declarations and includes.
+3. Use only the peripheral handles listed in the configuration (e.g. `hspi1`)
+   and only project functions, types and fields declared in the project headers
+   shown. A function that is declared nowhere does not exist: call one that is
+   declared, or implement it as a `static` helper in this file. Never call a
+   function you have not been shown. Do not invent HAL functions.
 4. Make the smallest change that fixes the error. Do not reformat other code.
 5. Reply with ONLY a JSON object:
 {
@@ -185,7 +188,7 @@ def build_repair_prompt(path: str, errors: list[Diagnostic], excerpts: str, cont
             f"# File: `{path}`",
             "\n# Diagnostics",
             *(f"- {d.as_prompt()}" for d in errors),
-            "\n# Hardware & Peripheral Configuration",
+            "\n# Project context",
             context or "(none)",
             "\n# Excerpts (line numbers are for reference only)",
             excerpts,

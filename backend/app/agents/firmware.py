@@ -627,6 +627,23 @@ async def firmware_node(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _repair_context(plan: CubeMXPlan, bundle: FirmwareBundle) -> str:
+    """Hardware config plus every project header's declarations.
+
+    The repair model sees excerpts of one file only. Without the headers it
+    guesses at what the other files offer -- the first real run "fixed" a
+    missing `MPU6050_Select` by calling an equally non-existent
+    `spi_bus_select`, citing a header it had never been shown.
+    """
+    return "\n".join(
+        [
+            _cubemx_context(plan),
+            "\n# Project headers (the only project functions and types that exist)",
+            _headers_context(bundle.files),
+        ]
+    )
+
+
 async def _repair_node(state: dict[str, Any]) -> dict[str, Any]:
     bundle = parse_stored(FirmwareBundle, state.get("firmware"))
     result = parse_stored(BuildResult, state.get("build"))
@@ -637,7 +654,7 @@ async def _repair_node(state: dict[str, Any]) -> dict[str, Any]:
         bundle,
         result,
         project_id=state.get("project_id", ""),
-        context=_cubemx_context(plan),
+        context=_repair_context(plan, bundle),
     )
     return {
         "firmware": dump(bundle),

@@ -318,3 +318,29 @@ def test_route_after_build_reads_only_the_flag():
 
 def test_graph_with_the_repair_edge_compiles():
     assert build_graph() is not None
+
+
+def test_repair_prompt_lists_the_project_headers(ws, monkeypatch):
+    header = SourceFile(
+        path="Core/Inc/spi_bus.h",
+        contents="#ifndef SPI_BUS_H\n#define SPI_BUS_H\nint SPI_Bus_Init(void);\n#endif\n",
+    )
+    bundle = _bundle()
+    bundle.files.append(header)
+    llm = FakeLLM({"path": APP_PATH, "edits": []})
+    monkeypatch.setattr(repair_module, "is_agent_enabled", lambda _name: True)
+    monkeypatch.setattr(repair_module, "get_agent_llm", lambda _name: llm)
+    state = {
+        "project_id": PROJECT_ID,
+        "cubemx": dump(PLAN),
+        "firmware": dump(bundle),
+        "build": dump(_failed()),
+        "attempt": 1,
+        "repair_next": True,
+    }
+
+    asyncio.run(firmware_module.firmware_node(state))
+
+    prompt = llm.calls[0][1]["content"]
+    assert "Core/Inc/spi_bus.h" in prompt
+    assert "int SPI_Bus_Init(void);" in prompt
