@@ -432,6 +432,18 @@ def _struct_lines(
     return lines
 
 
+def is_chip_select(assignment: PinAssignment) -> bool:
+    signal = str(assignment.signal or "").strip().upper()
+    return signal.endswith(("_CS", "_NSS", "_SS")) and not str(
+        assignment.mode or ""
+    ).strip().lower().startswith("alternate")
+
+
+def pin_label(signal: str) -> str:
+    """The main.h name of a plain pin: SPI1_CS -> SPI1_CS_Pin / SPI1_CS_GPIO_Port."""
+    return _IDENTIFIER_RE.sub("_", str(signal or "")).strip("_").upper()
+
+
 def gpio_init(plan: CubeMXPlan, warnings: list[str]) -> str:
     """MX_GPIO_Init: port clocks, plus every pin that is not a peripheral's."""
     plain = [
@@ -463,9 +475,10 @@ def gpio_init(plan: CubeMXPlan, warnings: list[str]) -> str:
         lines.append("")
         for assignment in resets:
             port, number = parse_pin(assignment.pin)
-            lines.append(
-                f"  HAL_GPIO_WritePin(GPIO{port}, GPIO_PIN_{number}, GPIO_PIN_RESET);"
-            )
+            # A chip select is active low: it has to idle high, or the device
+            # is selected from reset and the first transfer is garbage.
+            level = "GPIO_PIN_SET" if is_chip_select(assignment) else "GPIO_PIN_RESET"
+            lines.append(f"  HAL_GPIO_WritePin(GPIO{port}, GPIO_PIN_{number}, {level});")
 
     for (port, mode, pull, speed, alternate), numbers in _grouped(plain).items():
         lines.append("")
@@ -679,7 +692,7 @@ def _pin_defines(plan: CubeMXPlan) -> str:
     lines: list[str] = []
     for assignment in plan.pins:
         mode = str(assignment.mode or "").strip().lower()
-        label = _IDENTIFIER_RE.sub("_", str(assignment.signal or "")).strip("_").upper()
+        label = pin_label(assignment.signal)
         if mode == "alternate" or not label or label in seen:
             continue
         seen.add(label)

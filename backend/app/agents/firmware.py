@@ -22,7 +22,15 @@ from pydantic import BaseModel, Field
 from app.agents.base import request_contract
 from app.agents.repair import repair_firmware
 from app.build import workspace
-from app.codegen.peripherals import HANDLE_TYPES
+from app.codegen import checks
+from app.codegen.ownership import (
+    OWNERSHIP_RULE,
+    drop_includes,
+    scaffold_file,
+    scaffold_owned_path,
+    strip_owned,
+)
+from app.codegen.peripherals import HANDLE_TYPES, is_chip_select, pin_label
 from app.codegen.render import merge_user_code, render, user_regions
 from app.codegen.scaffold import scaffold_project
 from app.codegen.sdk import family
@@ -87,7 +95,7 @@ _BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 _LINE_COMMENT_RE = re.compile(r"//[^\n]*")
 _DEFINE_RE = re.compile(r"#\s*define\s+(?P<name>\w+(?:\([^)]*\))?)\s+(?P<body>\S.*)$")
 
-_SYSTEM_PROMPT = """You are an expert embedded firmware engineer writing C for STM32.
+_SYSTEM_PROMPT = f"""You are an expert embedded firmware engineer writing C for STM32.
 
 Write complete, compile-clean C source or header files according to the requirements,
 architecture, and peripheral configuration.
@@ -95,6 +103,7 @@ architecture, and peripheral configuration.
 Rules:
 1. Always use exact CubeMX HAL handle names provided (e.g. `hspi1`, `huart2`, `hi2c1`).
    Do NOT invent handle names like `spi1_handle`.
+   {OWNERSHIP_RULE}
 2. For `Core/Src/main.c` and `Core/Inc/main.h`:
    - All user code MUST be placed inside the standard CubeMX user code markers:
      `/* USER CODE BEGIN <Section> */`
@@ -108,17 +117,21 @@ Rules:
    - Include standard guards (`#ifndef ... #define ... #endif`).
    - `#include "main.h"` to access HAL definitions and peripheral handles.
    - Write complete, robust production-ready code with error checking.
-4. Only cite references from allowed citations for this step. If an API usage
+4. Finish the job. Every function you declare is defined, every module is
+   called (main.c: init in USER CODE 2, work in USER CODE WHILE), and there are
+   no placeholders: no "omitted", "TODO", "adjust as needed", no commented-out
+   calls. A project checker rejects all of these after the compile.
+5. Only cite references from allowed citations for this step. If an API usage
    is not covered by retrieved documentation, leave citations empty and note it
    under "assumptions".
-5. Reply with ONLY a JSON object in this format:
-{
+6. Reply with ONLY a JSON object in this format:
+{{
   "path": "Core/Src/example.c",
   "purpose": "Brief description of the file",
   "contents": "/* Complete file contents or USER CODE sections */",
   "citations": [],
   "assumptions": []
-}"""
+}}"""
 
 
 class FileProposal(BaseModel):
@@ -155,6 +168,21 @@ def _cubemx_context(plan: CubeMXPlan) -> str:
         for pin in plan.pins:
             sig = pin.signal or pin.peripheral
             lines.append(f"- {pin.pin}: {sig} (mode={pin.mode}, pull={pin.pull})")
+        plain = [
+            pin for pin in plan.pins
+            if pin.signal and not str(pin.mode or "").lower().startswith("alternate")
+        ]
+        if plain:
+            lines.append("\nGPIO names defined in main.h (use these, never a raw port/pin):")
+        for pin in plain:
+            label = pin_label(pin.signal)
+            note = ""
+            if is_chip_select(pin):
+                note = (
+                    " -- chip select, active low, idles high: drive it GPIO_PIN_RESET "
+                    "before a transfer and GPIO_PIN_SET after it"
+                )
+            lines.append(f"- {label}_GPIO_Port / {label}_Pin{note}")
     return "\n".join(lines)
 
 
@@ -374,6 +402,25 @@ def build_file_prompt(
     return "\n".join(sections)
 
 
+def _own_header(path: str) -> str:
+    """`Core/Src/x.c` -> `Core/Inc/x.h`; empty for anything that is not a source."""
+    if not path.endswith(".c"):
+        return ""
+    return path.replace("Core/Src/", "Core/Inc/", 1).removesuffix(".c") + ".h"
+
+
+def _contract_feedback(header_path: str, problems: list[str]) -> str:
+    return "\n".join(
+        [
+            f"Your file breaks {header_path}, which every caller is written against:",
+            *(f"- {problem}" for problem in problems),
+            "Keep the header's names and signatures exactly: define every function it "
+            "declares, with its parameters and return type. Reply with the complete "
+            "corrected JSON only.",
+        ]
+    )
+
+
 def _merge_scaffold_file(file_path: str, proposed_code: str, base_scaffold: str) -> str:
     """Merge user code into scaffold file ensuring system init is preserved."""
     if not base_scaffold:
@@ -437,8 +484,18 @@ async def generate_firmware(
             )
         ]
 
+    dropped: set[str] = set()
     for step in steps:
-        step_files = step.files
+        step_files = []
+        for file_path in step.files:
+            if scaffold_owned_path(file_path):
+                # The scaffold writes this file; a generated copy only
+                # duplicates its symbols.
+                warnings.append(f"{file_path}: owned by the CubeMX scaffold; not generated")
+                if not scaffold_file(file_path):
+                    dropped.add(file_path)
+            else:
+                step_files.append(file_path)
         if not step_files:
             continue
 
@@ -479,7 +536,7 @@ async def generate_firmware(
             ]
 
             try:
-                proposal, repair_warnings, _ = await request_contract(
+                proposal, repair_warnings, reply = await request_contract(
                     llm, FileProposal, messages, temperature=0.0
                 )
                 warnings.extend(repair_warnings)
@@ -488,11 +545,65 @@ async def generate_firmware(
                 warnings.append(f"Failed to generate {file_path}: {exc}")
                 continue
 
+            # Check the file against its own header right away, while the
+            # model still has the whole file in view -- the build would only
+            # report the first clash, and repair sees excerpts.
+            header_path = _own_header(file_path)
+            header = next(
+                (f.contents for f in reversed(generated_files) if f.path == header_path), ""
+            )
+            problems = (
+                checks.header_contract(header_path, header, file_path, proposal.contents)
+                if header
+                else []
+            )
+            if problems:
+                retry = [
+                    *messages,
+                    {"role": "assistant", "content": reply},
+                    {"role": "user", "content": _contract_feedback(header_path, problems)},
+                ]
+                try:
+                    proposal, repair_warnings, _ = await request_contract(
+                        llm, FileProposal, retry, temperature=0.0
+                    )
+                    warnings.extend(repair_warnings)
+                except ContractError as exc:
+                    warnings.append(f"{file_path}: header-contract retry failed: {exc}")
+            if header:
+                aligned, fixed = checks.align_definitions(
+                    header_path, header, proposal.contents
+                )
+                if fixed:
+                    warnings.append(
+                        f"{file_path}: parameter list of {', '.join(fixed)} taken from "
+                        f"{header_path}"
+                    )
+                    proposal = proposal.model_copy(update={"contents": aligned})
+                for problem in checks.header_contract(
+                    header_path, header, file_path, proposal.contents
+                ):
+                    warnings.append(f"{file_path}: {problem}")
+
             final_contents = proposal.contents
             if file_path in ("Core/Src/main.c", "Core/Inc/main.h") and scaffold_content:
                 final_contents = _merge_scaffold_file(
                     file_path, proposal.contents, scaffold_content
                 )
+
+            owned_contents, owned = strip_owned(file_path, final_contents)
+            if owned_contents is None:
+                warnings.append(
+                    f"{file_path}: only re-implemented scaffold code "
+                    f"({', '.join(owned)}); dropped"
+                )
+                dropped.add(file_path)
+                continue
+            if owned:
+                warnings.append(
+                    f"{file_path}: removed scaffold-owned {', '.join(owned)}"
+                )
+                final_contents = owned_contents
 
             valid_citations: list[str] = []
             for citation in proposal.citations:
@@ -552,6 +663,16 @@ async def generate_firmware(
                 )
             deduped[source_file.path] = source_file
         generated_files = list(deduped.values())
+
+    # A dropped header must not stay included: the build would stop on it.
+    dropped_headers = {path for path in dropped if path.endswith(".h")}
+    if dropped_headers:
+        generated_files = [
+            source_file.model_copy(
+                update={"contents": drop_includes(source_file.contents, dropped_headers)}
+            )
+            for source_file in generated_files
+        ]
 
     notes = [f"Generated {len(generated_files)} files across {len(steps)} steps."]
     if hardware.coverage < _LOW_COVERAGE:

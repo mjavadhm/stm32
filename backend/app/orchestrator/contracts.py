@@ -360,6 +360,10 @@ BUILD_OK = "ok"
 BUILD_FAILED = "failed"
 BUILD_TIMEOUT = "timeout"
 BUILD_UNAVAILABLE = "unavailable"  # the sandbox itself could not be reached
+# Compiled and linked, but the project checker (app/codegen/checks.py) found
+# it unfinished: a module nothing calls, a declared function never defined, a
+# placeholder where code should be. Binaries exist; the job is not done.
+BUILD_INCOMPLETE = "incomplete"
 
 
 class Diagnostic(BaseModel):
@@ -424,7 +428,7 @@ class BuildResult(Contract):
     delivered, with its errors attached, and M5 picks them up.
     """
 
-    status: str = BUILD_OK  # ok | failed | timeout | unavailable
+    status: str = BUILD_OK  # ok | failed | incomplete | timeout | unavailable
     exit_code: int = 0
     duration_ms: int = 0
     toolchain: str = ""  # arm-none-eabi-gcc 12.2.0

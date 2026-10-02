@@ -192,6 +192,20 @@ def _architecture_pins(architecture: Architecture) -> list[PinAssignment]:
             match = re.search(r"\bP[A-K](?:1[0-5]|\d)\b", raw.upper())
             if not match:
                 continue
+            chip_select = re.search(r"(?<![A-Z])(CS|NSS|SS)(?![A-Z])", raw.upper())
+            if chip_select and name.startswith("SPI"):
+                # A chip select named by the architecture is a plain output.
+                assignments.append(
+                    PinAssignment(
+                        pin=match.group(0),
+                        signal=f"{name}_CS",
+                        peripheral=name,
+                        mode="output",
+                        speed="very_high",
+                        citation=peripheral.citation,
+                    )
+                )
+                continue
             suffix_match = re.search(r"\b(SCK|MISO|MOSI|SCL|SDA|TX|RX)\b", raw.upper())
             if not suffix_match:
                 continue

@@ -14,9 +14,11 @@ from app.agents.repair import should_repair
 from app.build import workspace
 from app.build.artifacts import BUILD_LOG_PATH, record_artifacts
 from app.build.client import BuilderClient, get_builder_client
+from app.codegen import checks
 from app.codegen.devices import device_for
 from app.codegen.errors import CodegenError
 from app.orchestrator.contracts import (
+    BUILD_INCOMPLETE,
     BUILD_UNAVAILABLE,
     BuildResult,
     CubeMXPlan,
@@ -75,6 +77,9 @@ async def run_build(
         ram_total=ram_total,
     )
 
+    if result.ok:
+        check_result(project_id, result)
+
     if result.log_tail:
         try:
             workspace.write_file(project_id, BUILD_LOG_PATH, result.log_tail)
@@ -82,6 +87,33 @@ async def run_build(
             logger.debug("could not write %s for %s", BUILD_LOG_PATH, project_id, exc_info=True)
     await record_artifacts(project_id, attempt, result)
     return result
+
+
+def project_sources(project_id: str) -> dict[str, str]:
+    """Core/Src/*.c and Core/Inc/*.h as they are on disk now."""
+    base = workspace.workspace_path(project_id)
+    files: dict[str, str] = {}
+    for pattern in ("Core/Src/*.c", "Core/Inc/*.h"):
+        for path in sorted(base.glob(pattern)):
+            files[str(path.relative_to(base))] = path.read_text(encoding="utf-8", errors="replace")
+    return files
+
+
+def check_result(project_id: str, result: BuildResult) -> None:
+    """Hold a clean compile to the project checker; mutates `result`.
+
+    Done here rather than in the graph so a manual rebuild is held to the
+    same standard as the pipeline. Findings become error diagnostics and the
+    status becomes `incomplete`, which the repair loop treats like a failure.
+    """
+    try:
+        findings = checks.check_sources(project_sources(project_id))
+    except Exception:  # noqa: BLE001 - a checker bug must not lose the build
+        logger.exception("project checks failed for %s", project_id)
+        return
+    if findings:
+        result.diagnostics.extend(findings)
+        result.status = BUILD_INCOMPLETE
 
 
 def summarise_result(result: BuildResult) -> dict[str, Any]:

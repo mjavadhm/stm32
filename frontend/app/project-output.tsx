@@ -111,6 +111,9 @@ export function diagnosticLabel(d: Diagnostic): string {
 const BUILD_FA: Record<string, string> = {
   ok: "موفق",
   failed: "ناموفق",
+  // Compiled, but the project checker found it unfinished (uncalled module,
+  // undefined function, placeholder). Binaries exist; the job is not done.
+  incomplete: "ناقص",
   timeout: "تمام شدن زمان",
   unavailable: "سندباکس در دسترس نیست",
 };
@@ -118,6 +121,7 @@ const BUILD_FA: Record<string, string> = {
 const BUILD_BADGE: Record<string, string> = {
   ok: "done",
   failed: "failed",
+  incomplete: "cancelled",
   timeout: "cancelled",
   unavailable: "pending",
 };
@@ -219,7 +223,7 @@ function BuildPanel({
 
       {result && (
         <div className="build-stats small">
-          {result.status === "ok" && (
+          {(result.status === "ok" || result.status === "incomplete") && (
             <>
               <span>
                 Flash: {memoryUsage(result.size.text + result.size.data, result.size.flash_total)}

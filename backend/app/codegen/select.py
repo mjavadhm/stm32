@@ -23,6 +23,10 @@ REQUIRED_SIGNALS: dict[str, tuple[str, ...]] = {
     "TIM": (),
 }
 
+# Suffix of the GPIO that selects the device on an SPI bus driven with a
+# software NSS. main.h then carries SPI1_CS_Pin / SPI1_CS_GPIO_Port.
+CHIP_SELECT = "CS"
+
 DIRECTIONS = {
     "RX": "peripheral_to_memory",
     "TX": "memory_to_peripheral",
@@ -167,6 +171,81 @@ def select_pins(
     return result
 
 
+def _software_nss_master(config) -> bool:
+    if peripherals.family(config.peripheral) != "SPI":
+        return False
+    mode = str(config.mode or "").strip().lower()
+    if "slave" in mode:
+        return False
+    nss = str((config.parameters or {}).get("NSS", "")).strip().upper()
+    return "HARD" not in nss
+
+
+def has_chip_select(plan: CubeMXPlan, peripheral: str) -> bool:
+    name = str(peripheral or "").strip().upper()
+    return any(
+        str(assignment.peripheral or "").strip().upper() == name
+        and str(assignment.mode or "").strip().lower().startswith("output")
+        for assignment in plan.pins
+    )
+
+
+def select_chip_selects(
+    plan: CubeMXPlan,
+    data: DeviceData,
+    *,
+    policy: str = "deterministic",
+) -> Selection:
+    """A chip-select output for every SPI master with a software NSS.
+
+    `SPI_NSS_SOFT` means nothing drives the device's CS line, so somebody has
+    to -- and without a pin in the plan the model writes
+    `/* HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, ...) */` and a bus that never
+    selects its slave. The pin is picked like every other pin: the one that
+    carries this SPI's NSS signal if it is free (PA4 for SPI1, what most
+    boards wire), else the first free pin in table order.
+    """
+    result = Selection()
+    occupied = {
+        str(assignment.pin or "").strip().upper()
+        for assignment in plan.pins
+        if str(assignment.pin or "").strip()
+    }
+    for config in plan.peripherals:
+        name = str(config.peripheral or "").strip().upper()
+        if not _software_nss_master(config) or has_chip_select(plan, name):
+            continue
+        if policy == "explicit":
+            result.warnings.append(
+                f"{name}: software NSS but no chip-select output in the plan; add "
+                f"{name}_{CHIP_SELECT} as an output pin"
+            )
+            continue
+        preferred = [pin for pin in data.pins_for(f"{name}_NSS") if pin.upper() not in occupied]
+        fallback = sorted(
+            (pin for pin in data.pins if pin.upper() not in occupied), key=_pin_key
+        )
+        choice = (preferred or fallback or [None])[0]
+        if choice is None:
+            result.errors.append(f"{name}: no free pin is left for its chip-select output")
+            continue
+        occupied.add(choice.upper())
+        plan.pins.append(
+            PinAssignment(
+                pin=choice,
+                signal=f"{name}_{CHIP_SELECT}",
+                peripheral=name,
+                mode="output",
+                pull="none",
+                speed="very_high",
+            )
+        )
+        result.selected_pins.append(f"{name}_{CHIP_SELECT}={choice}")
+    if result.selected_pins:
+        plan.pins.sort(key=lambda assignment: (_pin_key(assignment.pin), assignment.signal))
+    return result
+
+
 def _normalise_dma(config: DmaConfig, peripheral: str) -> None:
     request = str(config.request or "").strip().upper()
     direction = str(config.direction or "").strip().lower()
@@ -255,10 +334,12 @@ def complete_plan(
 ) -> Selection:
     """Complete pins and DMA routes without validating any guessed fact."""
     pins = select_pins(plan, data, policy=pin_policy)
+    # After the alternate-function pins, so a CS never takes a pin SCK needed.
+    chip_selects = select_chip_selects(plan, data, policy=pin_policy)
     dma = select_dma(plan, data)
     return Selection(
-        selected_pins=pins.selected_pins,
+        selected_pins=[*pins.selected_pins, *chip_selects.selected_pins],
         selected_dma=dma.selected_dma,
-        errors=[*pins.errors, *dma.errors],
-        warnings=[*pins.warnings, *dma.warnings],
+        errors=[*pins.errors, *chip_selects.errors, *dma.errors],
+        warnings=[*pins.warnings, *chip_selects.warnings, *dma.warnings],
     )
