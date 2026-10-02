@@ -1000,3 +1000,158 @@ code {
   border-radius: 6px;
   background: #fff;
 }
+
+/* ==========================================================================
+   Project output (M4): build panel, file tree, code viewer
+   ========================================================================== */
+
+.project-output {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.build-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  border: 1px solid #2a2f3a;
+  border-radius: 8px;
+  padding: 0.85rem;
+}
+
+.build-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1rem;
+  color: #b8bec9;
+  direction: ltr;
+  justify-content: flex-end;
+}
+
+.diagnostics {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  max-height: 220px;
+  overflow-y: auto;
+  direction: ltr;
+  text-align: left;
+  font-family: ui-monospace, "Fira Code", monospace;
+  font-size: 0.78rem;
+}
+
+.diag {
+  padding: 0.2rem 0.45rem;
+  border-inline-start: 3px solid #2a2f3a;
+  overflow-wrap: anywhere;
+}
+
+.diag-error {
+  border-color: #b23b3b;
+  color: #f09a9a;
+}
+
+.diag-warning {
+  border-color: #8a6d2f;
+  color: #e6c877;
+}
+
+.build-log summary {
+  cursor: pointer;
+  color: #9aa3b2;
+  font-size: 0.85rem;
+}
+
+.build-log pre {
+  max-height: 320px;
+  overflow: auto;
+  margin-top: 0.4rem;
+}
+
+.button-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.file-browser {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.8fr) minmax(0, 2fr);
+  gap: 0.75rem;
+  direction: ltr;
+  text-align: left;
+}
+
+@media (max-width: 860px) {
+  .file-browser {
+    grid-template-columns: 1fr;
+  }
+}
+
+.file-pane {
+  max-height: 520px;
+  overflow: auto;
+  border: 1px solid #2a2f3a;
+  border-radius: 8px;
+  padding: 0.5rem;
+  font-family: ui-monospace, "Fira Code", monospace;
+  font-size: 0.8rem;
+}
+
+.file-tree {
+  list-style: none;
+  padding-inline-start: 0.8rem;
+}
+
+.file-pane > .file-tree {
+  padding-inline-start: 0;
+}
+
+.file-tree summary {
+  cursor: pointer;
+  color: #b8bec9;
+  padding: 0.1rem 0;
+}
+
+.file-entry {
+  background: transparent;
+  color: #cdd3de;
+  font-family: inherit;
+  font-size: inherit;
+  padding: 0.1rem 0.3rem;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  text-align: left;
+}
+
+.file-entry:hover,
+.file-entry.selected {
+  background: #1b2030;
+  color: #fff;
+}
+
+.file-tag {
+  font-size: 0.65rem;
+  color: #7fd6a9;
+  border: 1px solid #2f6f4f;
+  border-radius: 4px;
+  padding: 0 0.25rem;
+}
+
+.code-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  min-width: 0;
+}
+
+.code-view {
+  max-height: 520px;
+  overflow: auto;
+  white-space: pre;
+}
