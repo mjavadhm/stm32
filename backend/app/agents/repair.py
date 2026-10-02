@@ -301,6 +301,51 @@ def _read_current(project_id: str, bundle: FirmwareBundle, path: str) -> str | N
     return source.contents if source is not None else None
 
 
+def _align_with_header(
+    path: str,
+    text: str,
+    errors: list[Diagnostic],
+    headers: dict[str, str],
+    report: dict[str, Any],
+) -> tuple[str, list[Diagnostic]]:
+    """Fix a `(void)` definition its header declares with parameters.
+
+    The commonest clash a weak model leaves, and one with a single right
+    answer: callers were written against the header. The errors it settles
+    are dropped so the model is not asked about them.
+    """
+    header_path = path.replace("Core/Src/", "Core/Inc/", 1).removesuffix(".c") + ".h"
+    header = headers.get(header_path)
+    if not path.endswith(".c") or not header:
+        return text, errors
+    aligned, fixed = checks.align_definitions(header_path, header, text)
+    if not fixed:
+        return text, errors
+    report["notes"].append(f"{path}: parameters of {', '.join(fixed)} taken from {header_path}")
+    remaining = [
+        error
+        for error in errors
+        if not any(f"conflicting types for '{name}'" in error.message for name in fixed)
+    ]
+    return aligned, remaining
+
+
+def _store(
+    project_id: str, bundle: FirmwareBundle, path: str, text: str, warnings: list[str]
+) -> None:
+    if project_id:
+        try:
+            workspace.write_file(project_id, path, text)
+        except workspace.WorkspaceError as exc:
+            warnings.append(f"repair: could not write {path}: {exc}")
+            return
+    for index, source in enumerate(bundle.files):
+        if source.path == path:
+            bundle.files[index] = source.model_copy(update={"contents": text})
+            return
+    bundle.files.append(SourceFile(path=path, contents=text, purpose="repair"))
+
+
 async def repair_firmware(
     bundle: FirmwareBundle,
     result: BuildResult,
@@ -335,6 +380,14 @@ async def repair_firmware(
             return bundle, warnings, report
         llm = get_agent_llm(AGENT_NAME)
 
+    headers = {
+        source.path: _read_current(project_id, bundle, source.path) or source.contents
+        for source in bundle.files
+        if source.path.endswith(".h")
+    }
+    errors = checks.explain_conflicts(errors, headers)
+    report["errors"] = [d.as_prompt() for d in errors]
+
     by_file: dict[str, list[Diagnostic]] = {}
     for diagnostic in errors:
         by_file.setdefault(diagnostic.file, []).append(diagnostic)
@@ -344,6 +397,13 @@ async def repair_firmware(
         original = _read_current(project_id, updated, path)
         if original is None:
             warnings.append(f"repair: {path} not found")
+            continue
+        read = original
+        original, file_errors = _align_with_header(path, original, file_errors, headers, report)
+        if not file_errors:
+            # Settled without the model; persist it like any applied patch.
+            _store(project_id, updated, path, original, warnings)
+            report["files"][path] = 1
             continue
         lines = original.split("\n")
         windows = error_windows(len(lines), file_errors)
@@ -395,7 +455,9 @@ async def repair_firmware(
                     {"role": "user", "content": _guard_feedback(problems)},
                 ]
         if not applied:
-            report["files"][path] = 0
+            if original != read:
+                _store(project_id, updated, path, original, warnings)
+            report["files"][path] = int(original != read)
             continue
         # A patch must not bring back what the scaffold owns.
         owned_contents, owned = strip_owned(path, patched)

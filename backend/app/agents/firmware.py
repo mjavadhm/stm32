@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from app.agents.base import request_contract
 from app.agents.repair import repair_firmware
 from app.build import workspace
+from app.codegen import checks
 from app.codegen.ownership import (
     OWNERSHIP_RULE,
     drop_includes,
@@ -401,6 +402,25 @@ def build_file_prompt(
     return "\n".join(sections)
 
 
+def _own_header(path: str) -> str:
+    """`Core/Src/x.c` -> `Core/Inc/x.h`; empty for anything that is not a source."""
+    if not path.endswith(".c"):
+        return ""
+    return path.replace("Core/Src/", "Core/Inc/", 1).removesuffix(".c") + ".h"
+
+
+def _contract_feedback(header_path: str, problems: list[str]) -> str:
+    return "\n".join(
+        [
+            f"Your file breaks {header_path}, which every caller is written against:",
+            *(f"- {problem}" for problem in problems),
+            "Keep the header's names and signatures exactly: define every function it "
+            "declares, with its parameters and return type. Reply with the complete "
+            "corrected JSON only.",
+        ]
+    )
+
+
 def _merge_scaffold_file(file_path: str, proposed_code: str, base_scaffold: str) -> str:
     """Merge user code into scaffold file ensuring system init is preserved."""
     if not base_scaffold:
@@ -516,7 +536,7 @@ async def generate_firmware(
             ]
 
             try:
-                proposal, repair_warnings, _ = await request_contract(
+                proposal, repair_warnings, reply = await request_contract(
                     llm, FileProposal, messages, temperature=0.0
                 )
                 warnings.extend(repair_warnings)
@@ -524,6 +544,46 @@ async def generate_firmware(
                 logger.error("Failed to generate file %s: %s", file_path, exc)
                 warnings.append(f"Failed to generate {file_path}: {exc}")
                 continue
+
+            # Check the file against its own header right away, while the
+            # model still has the whole file in view -- the build would only
+            # report the first clash, and repair sees excerpts.
+            header_path = _own_header(file_path)
+            header = next(
+                (f.contents for f in reversed(generated_files) if f.path == header_path), ""
+            )
+            problems = (
+                checks.header_contract(header_path, header, file_path, proposal.contents)
+                if header
+                else []
+            )
+            if problems:
+                retry = [
+                    *messages,
+                    {"role": "assistant", "content": reply},
+                    {"role": "user", "content": _contract_feedback(header_path, problems)},
+                ]
+                try:
+                    proposal, repair_warnings, _ = await request_contract(
+                        llm, FileProposal, retry, temperature=0.0
+                    )
+                    warnings.extend(repair_warnings)
+                except ContractError as exc:
+                    warnings.append(f"{file_path}: header-contract retry failed: {exc}")
+            if header:
+                aligned, fixed = checks.align_definitions(
+                    header_path, header, proposal.contents
+                )
+                if fixed:
+                    warnings.append(
+                        f"{file_path}: parameter list of {', '.join(fixed)} taken from "
+                        f"{header_path}"
+                    )
+                    proposal = proposal.model_copy(update={"contents": aligned})
+                for problem in checks.header_contract(
+                    header_path, header, file_path, proposal.contents
+                ):
+                    warnings.append(f"{file_path}: {problem}")
 
             final_contents = proposal.contents
             if file_path in ("Core/Src/main.c", "Core/Inc/main.h") and scaffold_content:

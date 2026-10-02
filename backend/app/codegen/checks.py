@@ -520,3 +520,105 @@ def calls(text: str) -> set[str]:
 def unfinished_markers(path: str, text: str) -> int:
     """How many placeholder comments / commented-out calls a file carries."""
     return len(placeholder_findings(path, text))
+
+
+# --------------------------------------------------------------------------
+# A source against its own header (generation and repair)
+# --------------------------------------------------------------------------
+
+_CONFLICT_RE = re.compile(r"conflicting types for '(?P<name>\w+)'")
+
+
+def _declaration_text(text: str, parsed: Parsed, declaration: Function) -> str:
+    end = parsed.masked.find(";", declaration.offset)
+    return " ".join(text[declaration.offset : end].split())
+
+
+def header_contract(header_path: str, header: str, source_path: str, source: str) -> list[str]:
+    """What a source breaks of its own header, one sentence per problem.
+
+    The header is the contract: it is generated first and every caller is
+    written against it, so the fix is always on the definition side.
+    """
+    head = parse(header_path, header)
+    body = parse(source_path, source)
+    defined = {function.name: function for function in body.definitions}
+    problems: list[str] = []
+    for declaration in head.declarations:
+        wanted = _declaration_text(header, head, declaration)
+        definition = defined.get(declaration.name)
+        if definition is None:
+            problems.append(
+                f"{header_path} declares `{wanted}` but {source_path} does not define it"
+            )
+        elif definition.signature != declaration.signature:
+            problems.append(
+                f"{source_path}:{definition.line} defines `{definition.signature}` but "
+                f"{header_path} declares `{wanted}`; use the header's signature"
+            )
+    return problems
+
+
+def align_definitions(header_path: str, header: str, source: str) -> tuple[str, list[str]]:
+    """Give a `(void)` definition the parameter list its header declares.
+
+    Only when the return types already agree and the definition takes no
+    parameters: then the body cannot refer to them, and copying the header's
+    list is a fix that cannot change what the body does.
+    """
+    head = parse(header_path, header)
+    declared = {d.name: d for d in head.declarations}
+    fixed: list[str] = []
+    for match in reversed(list(_DEF_HEAD_RE.finditer(mask(source)[0]))):
+        declaration = declared.get(match.group("name"))
+        if declaration is None or " ".join(match.group("params").split()) not in ("", "void"):
+            continue
+        signature, _ = _signature(match.group("ret"), match.group("name"), "void")
+        wanted_ret = declaration.signature.split(f" {declaration.name}(", 1)[0]
+        if signature.split(f" {declaration.name}(", 1)[0] != wanted_ret:
+            continue
+        if declaration.signature == signature:
+            continue
+        wanted = _declaration_text(header, head, declaration)
+        params = wanted[wanted.index("(") :]
+        source = source[: match.start("open")] + params + source[match.end("close") :]
+        fixed.append(declaration.name)
+    return source, sorted(fixed)
+
+
+_DEF_HEAD_RE = re.compile(
+    r"^(?P<ret>[A-Za-z_][\w \t\*]*?[\w\*])[ \t]*\b(?P<name>[A-Za-z_]\w*)[ \t]*"
+    r"(?P<open>\()(?P<params>[^()]*)(?P<close>\))\s*\{",
+    re.MULTILINE,
+)
+
+
+def explain_conflicts(errors: list[Diagnostic], files: dict[str, str]) -> list[Diagnostic]:
+    """Add the header's declaration to gcc's "conflicting types" errors.
+
+    gcc names the clash; the declaration it clashes with sits in a note the
+    repair prompt never shows, so the model guesses which side to change.
+    """
+    declarations: dict[str, str] = {}
+    for path, text in files.items():
+        if path.endswith(".h"):
+            parsed = parse(path, text)
+            for declaration in parsed.declarations:
+                declarations.setdefault(
+                    declaration.name,
+                    f"{path}:{declaration.line} `"
+                    f"{_declaration_text(text, parsed, declaration)}`",
+                )
+    explained = []
+    for error in errors:
+        match = _CONFLICT_RE.search(error.message)
+        where = declarations.get(match.group("name")) if match else None
+        if where and "declared in" not in error.message:
+            error = error.model_copy(
+                update={
+                    "message": f"{error.message}; declared in {where}, which every caller "
+                    "uses: change this definition to match it"
+                }
+            )
+        explained.append(error)
+    return explained
