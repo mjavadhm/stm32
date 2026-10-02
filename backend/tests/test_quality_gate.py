@@ -2,8 +2,8 @@
 
 The first real MPU6050 run "succeeded": it compiled after the repair loop
 deleted the failing calls, left `/* Sensor read omitted */` in main(), kept
-a commented-out CS write and a `0x6B\u793e` macro. Every case below is a piece
-of that project.
+a commented-out CS write and a register macro with a stray CJK character
+after it. Every case below is a piece of that project.
 """
 
 import asyncio
@@ -135,7 +135,7 @@ def test_the_hollow_demo_project_is_caught_on_every_count():
     codes = _codes(findings)
 
     assert ("Core/Src/main.c", 9, "check-unreachable") in codes  # USER CODE BEGIN 2
-    assert ("Core/Src/main.c", 15, "check-unreachable") in codes  # USER CODE BEGIN WHILE
+    assert ("Core/Src/main.c", 14, "check-unreachable") in codes  # USER CODE BEGIN WHILE
     assert ("Core/Inc/mpu6050.h", 11, "check-undefined") in codes
     assert ("Core/Src/main.c", 10, "check-placeholder") in codes
     assert ("Core/Src/mpu6050.c", 5, "check-commented-code") in codes
@@ -143,7 +143,7 @@ def test_the_hollow_demo_project_is_caught_on_every_count():
     assert all(d.severity == "error" and d.tool == checks.TOOL for d in findings)
     # Templates are never blamed, and template text outside USER CODE is not the model's.
     assert not any(d.file == "Core/Src/system_stm32f4xx.c" for d in findings)
-    assert not any(d.line == 22 for d in findings if d.file == "Core/Src/main.c")
+    assert not any(d.line == 21 for d in findings if d.file == "Core/Src/main.c")
     # Most consequential first: the repair loop only sees the first few.
     assert findings[0].code == "check-unreachable"
 
@@ -255,7 +255,9 @@ def test_a_rejected_patch_gets_one_more_try_with_the_reason(ws):
         },
     )
 
-    updated, _warnings, report = asyncio.run(repair_firmware(bundle, failed, project_id=ws, llm=llm))
+    updated, _warnings, report = asyncio.run(
+        repair_firmware(bundle, failed, project_id=ws, llm=llm)
+    )
 
     assert len(llm.calls) == 2
     assert "Rejected" in llm.calls[1][-1]["content"]
