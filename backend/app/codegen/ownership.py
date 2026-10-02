@@ -20,10 +20,11 @@ _SCAFFOLD_FILE_RE = re.compile(
     r"|startup_stm32\w*|syscalls|sysmem)$",
     re.IGNORECASE,
 )
-# A module named after a peripheral is CubeMX's own per-peripheral init file.
+# A module named after a peripheral instance is CubeMX's own init file. The
+# instance number is required: `uart.c` or `spi.c` may be an app-level wrapper.
 _PERIPHERAL_FILE_RE = re.compile(
-    r"^(?:gpio|dma|spi\d*|i2c\d*|i2s\d*|u?s?art\d*|lpuart\d*|tim\d*|adc\d*|dac\d*"
-    r"|can\d*|rtc|crc|rng|iwdg|wwdg|sdio|fsmc|usb_\w+|usb)$",
+    r"^(?:gpio|dma|spi\d+|i2c\d+|i2s\d+|u?s?art\d+|lpuart\d+|tim\d+|adc\d+|dac\d*"
+    r"|can\d+|rtc|crc|rng|iwdg|wwdg|sdio|fsmc)$",
     re.IGNORECASE,
 )
 RESERVED_FUNCTION_RE = re.compile(

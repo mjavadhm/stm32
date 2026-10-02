@@ -109,7 +109,14 @@ def test_peripheral_and_scaffold_files_are_owned():
         "Core/Src/stm32f4xx_hal_msp.c",
     ]:
         assert scaffold_owned_path(path), path
-    for path in ["Core/Src/main.c", "Core/Inc/main.h", "Core/Src/mpu6050.c", "Core/Src/spi_bus.c"]:
+    for path in [
+        "Core/Src/main.c",
+        "Core/Inc/main.h",
+        "Core/Src/mpu6050.c",
+        "Core/Src/spi_bus.c",
+        "Core/Src/uart.c",
+        "Core/Src/spi.c",
+    ]:
         assert not scaffold_owned_path(path), path
     assert scaffold_file("Core/Inc/stm32f4xx_it.h")
     assert not scaffold_file("Core/Inc/spi1.h")
@@ -218,7 +225,7 @@ def test_generation_skips_and_strips_scaffold_code():
         )
     )
     assert "Core/Src/gpio.c" not in llm.paths
-    assert bundle.paths() == ["Core/Src/mpu6050.c"]
+    assert bundle.paths == ["Core/Src/mpu6050.c"]
     driver = bundle.files[0].contents
     assert '#include "spi_bus.h"' not in driver
     assert "extern SPI_HandleTypeDef hspi1;" in driver
