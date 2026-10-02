@@ -219,13 +219,18 @@ function BuildPanel({
 
       {result && (
         <div className="build-stats small">
-          <span>
-            Flash: {memoryUsage(result.size.text + result.size.data, result.size.flash_total)}
-          </span>
-          <span>
-            RAM: {memoryUsage(result.size.data + result.size.bss, result.size.ram_total)}
-          </span>
-          <span>
+          {result.status === "ok" && (
+            <>
+              <span>
+                Flash: {memoryUsage(result.size.text + result.size.data, result.size.flash_total)}
+              </span>
+              <span>
+                RAM: {memoryUsage(result.size.data + result.size.bss, result.size.ram_total)}
+              </span>
+            </>
+          )}
+          {/* RTL island: inside the LTR stats row the numbers otherwise swap sides. */}
+          <span dir="rtl">
             {errors.length} خطا · {warnings.length} هشدار
           </span>
           {result.duration_ms > 0 && <span>{(result.duration_ms / 1000).toFixed(1)}s</span>}
